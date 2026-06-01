@@ -215,7 +215,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             use_1stage = (
                 self._ar_1stage_override
                 if self._ar_1stage_override is not None
-                else (total_bytes <= 128 * 1024)
+                else (total_bytes <= 1024 * 1024)
             )
             out, res_out = ca_comm.custom_fused_ar_rms(
                 input_, res_inp_, weight_, eps, use_1stage
