@@ -1948,18 +1948,6 @@ namespace py = pybind11;
           py::arg("final_output"),       \
           py::arg("final_lse") = std::nullopt);
 
-#define MLA_DECODE_REDUCE_PYBIND         \
-    m.def("mla_decode_reduce",           \
-          &mla_decode_reduce,            \
-          py::arg("partial_output"),     \
-          py::arg("partial_lse"),        \
-          py::arg("reduced"),            \
-          py::arg("kv_indptr"),          \
-          py::arg("T"),                  \
-          py::arg("batch"),              \
-          py::arg("vec")        = 1,     \
-          py::arg("num_splits") = 16);
-
 #define TOPK_PLAIN_PYBIND                         \
     m.def("topk_plain",                           \
           &topk_plain,                            \

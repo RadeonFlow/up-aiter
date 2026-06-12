@@ -1,9 +1,0 @@
-cu_num,token,num_heads,kv_lora_rank,v_head_dim,num_kv_splits,reduce_kernel,us_reduce,_tag
-256,0,16,512,128,16,mla_reduce_BATCH4,*,default
-256,4,16,512,128,16,mla_reduce_BATCH2,3.36,decode
-256,8,16,512,128,16,mla_reduce_BATCH4,*,decode
-256,16,16,512,128,16,mla_reduce_BATCH8,3.40,decode
-256,32,16,512,128,16,mla_reduce_BATCH8,4.24,decode
-256,64,16,512,128,16,mla_reduce_BATCH4,7.44,decode
-256,128,16,512,128,16,mla_reduce_BATCH8,14.04,decode
-256,256,16,512,128,16,mla_reduce_BATCH8,*,decode

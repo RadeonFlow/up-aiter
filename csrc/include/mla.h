@@ -75,20 +75,6 @@ void mla_reduce_v1(const torch::Tensor& partial_output,
                    torch::Tensor& final_output,
                    std::optional<torch::Tensor>& final_lse);
 
-// LSE-weighted reduce across N_SPLITS partials (fp32 → bf16) for the plain-TP
-// MLA decode path. Caller-owned `reduced` workspace [T, H, K] bf16. Templated
-// over (H, K, N_SPLITS, BATCH, VEC) internally; the host entry switches on
-// (num_splits, batch, vec). The default instantiation is (16, 512, 16, 4, 4).
-void mla_decode_reduce(
-    torch::Tensor& partial_output,  // [T*num_splits, H, K]  fp32
-    torch::Tensor& partial_lse,     // [T*num_splits, H]     fp32
-    torch::Tensor& reduced,         // [T, H, K]             bf16  (out)
-    torch::Tensor& kv_indptr,       // [T+1]                 int32
-    int64_t T,
-    int64_t batch,
-    int64_t vec,
-    int64_t num_splits);
-
 void get_pa_metadata_v1(const torch::Tensor& seqlens_qo_indptr, // [batch size + 1]
                         const torch::Tensor& seqlens_kv_indptr, // [batch size + 1]
                         const int32_t num_heads_per_head_k,
