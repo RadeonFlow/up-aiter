@@ -202,6 +202,45 @@ def get_GEMM_A16W16_config(
     return config
 
 
+# ---- prezero (co-design) tuned GEMM ------------------------------------------------------
+# CSV-gated no-zero split-K GEMM into a pre-zeroed buffer. The CSV carries the per-(shape,M)
+# tile params (BN, SPLITK, BM); BK is fixed 128. Hit -> the no-zero kernel; miss -> tgemm.
+
+
+@functools.lru_cache(maxsize=1)
+def get_GEMM_PREZERO_config_():
+    tuned_file = AITER_CONFIGS.AITER_CONFIG_GEMM_PREZERO_FILE
+    gemm_dict = {}
+    if os.path.exists(tuned_file):
+        df = pd.read_csv(f"{tuned_file}").drop_duplicates()
+        gemm_dict = df.set_index(
+            ["cu_num", "M", "N", "K", "bias", "dtype", "outdtype"]
+        ).to_dict("index")
+    return gemm_dict
+
+
+# Flattened HOT-PATH table for tgemm_prezero: (cu_num, M, N, K) -> (BN, SPLITK, BM) as ints, bf16
+# bias-free rows only. Built once from the CSV so the per-call dispatch is a single dict.get on a
+# 4-int key (no str(dtype) / no lru_cache hashing of a 6-tuple) — keeps the wrapper's CPU overhead
+# off the decode critical path vs the raw splitk_gemm_with_prezero op.
+_PREZERO_GEMM_TILES = None
+_PREZERO_CU_NUM = None
+
+
+def _prezero_gemm_tiles():
+    global _PREZERO_GEMM_TILES, _PREZERO_CU_NUM
+    if _PREZERO_GEMM_TILES is None:
+        _PREZERO_CU_NUM = get_cu_num()
+        d = {}
+        for k, v in get_GEMM_PREZERO_config_().items():
+            cu, M, N, K, bias, dt, ot = k
+            if bias or str(dt) != "torch.bfloat16":
+                continue
+            d[(cu, M, N, K)] = (int(v["BN"]), int(v["SPLITK"]), int(v["BM"]))
+        _PREZERO_GEMM_TILES = d
+    return _PREZERO_GEMM_TILES
+
+
 def save_shapes(
     M,
     N,
@@ -622,6 +661,33 @@ class TunedGemm:
             scale_c=scale_c,
         )
         return out
+
+
+def tgemm_prezero(
+    C: Tensor,
+    A: Tensor,
+    B: Tensor,
+    bias: Optional[Tensor] = None,
+    otype: Optional[torch.dtype] = None,
+) -> Tensor:
+    """Prezero co-design GEMM: out[M,N] = A[M,K] @ B[N,K]^T. Follows the `tgemm` convention —
+    USE THE RETURN VALUE; both paths are zero-copy:
+      - hit (cu_num,M,N,K,dtype in a16w16_prezero_tuned_gemm.csv): the no-zero split-K kernel
+        atomic-adds into the pre-zeroed buffer C (zero_init=false) and returns C (aliased). C
+        MUST already be pre-zeroed by the upstream producer (fused AR / RMSNorm gemm_zero).
+      - miss: returns a FRESH tensor from the tuned bf16 gemm (`tgemm`); C is left untouched.
+    So `out = tgemm_prezero(C, A, B)` aliases C on the hit path and is a fresh tensor on the
+    fallback path — callers must consume `out` (not C). Hit requires M to be an exact tuned
+    bucket (the MLA decode caller bucket-pads A/C); any other M (or bias / non-bf16) falls back.
+    bias is only honored on the fallback."""
+    tiles = _PREZERO_GEMM_TILES if _PREZERO_GEMM_TILES is not None else _prezero_gemm_tiles()
+    if bias is None and A.dtype is torch.bfloat16:
+        t = tiles.get((_PREZERO_CU_NUM, A.shape[0], B.shape[0], A.shape[1]))
+        if t is not None:
+            aiter.splitk_gemm_prezero_tuned(C, A, B, t[0], t[1], t[2])
+            return C
+    # fallback (cold path): tuned bf16 gemm -> fresh tensor (no copy; caller uses the return).
+    return gemm_a16w16(A, B, bias=bias, otype=otype if otype is not None else A.dtype)
 
 
 tgemm = TunedGemm()

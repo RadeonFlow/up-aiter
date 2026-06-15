@@ -124,6 +124,11 @@ AITER_CONFIG_GEMM_BF16 = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_gemm.csv",
 )
 
+AITER_CONFIG_GEMM_PREZERO = os.getenv(
+    "AITER_CONFIG_GEMM_PREZERO",
+    f"{AITER_ROOT_DIR}/aiter/configs/a16w16_prezero_tuned_gemm.csv",
+)
+
 
 class AITER_CONFIG(object):
     @property
@@ -190,6 +195,14 @@ class AITER_CONFIG(object):
     def AITER_CONFIG_GEMM_BF16_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_GEMM_BF16", AITER_CONFIG_GEMM_BF16, "bf16_tuned_gemm"
+        )
+
+    @property
+    def AITER_CONFIG_GEMM_PREZERO_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_PREZERO",
+            AITER_CONFIG_GEMM_PREZERO,
+            "a16w16_prezero_tuned_gemm",
         )
 
     def update_config_files(self, file_path: str, merge_name: str):
