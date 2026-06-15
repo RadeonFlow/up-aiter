@@ -1535,5 +1535,34 @@
         "extra_include": [],
         "verbose": "False",
         "blob_gen_cmd": "''"
+    },
+    "module_mla_rmsnorm": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/kernels/prezero_gemm/mla_rmsnorm_host.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-std=c++20'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{AITER_CSRC_DIR}/kernels/prezero_gemm'"
+        ],
+        "verbose": "False"
+    },
+    "module_mla_gemm": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/kernels/prezero_gemm/mla_gemm_host.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-std=c++20'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{AITER_CSRC_DIR}/kernels/prezero_gemm'",
+            "f'{AITER_CSRC_DIR}/include/opus'"
+        ],
+        "verbose": "False"
     }
 }

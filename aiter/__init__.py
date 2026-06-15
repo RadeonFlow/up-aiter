@@ -118,6 +118,7 @@ else:
     from .ops.mhc import *  # noqa: F403,E402
     from .ops.causal_conv1d import *  # noqa: F403,E402
     from .ops.fused_split_gdr_update import *  # noqa: F403,E402
+    from .ops.mla_decode import *  # noqa: F403,E402
     from . import mla  # noqa: F403,F401,E402
 
 # Import Triton-based communication primitives from ops.triton.comms (optional, only if Iris is available)
