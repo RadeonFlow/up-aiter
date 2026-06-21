@@ -26,7 +26,7 @@ void splitk_gemm_with_prezero(torch::Tensor& C, torch::Tensor& A, torch::Tensor&
     const hipStream_t stream = at::hip::getCurrentHIPStream();
     const int M = A.size(0), K = A.size(1), N = B.size(0);
     TORCH_CHECK(B.size(1) == K, "splitk_gemm_with_prezero: A[M,K] @ B[N,K]^T, K mismatch");
-    TORCH_CHECK(C.size(0) == M && C.size(1) == N, "C must be [M,N]");
+    TORCH_CHECK(C.size(0) >= M && C.size(1) == N, "C must have shape [>=M,N]");
 
     auto* a = reinterpret_cast<const bf16*>(A.data_ptr());
     auto* b = reinterpret_cast<const bf16*>(B.data_ptr());
@@ -96,7 +96,7 @@ void splitk_gemm_prezero_tuned(torch::Tensor& C, torch::Tensor& A, torch::Tensor
     const hipStream_t stream = at::hip::getCurrentHIPStream();
     const int M = A.size(0), K = A.size(1), N = B.size(0);
     TORCH_CHECK(B.size(1) == K, "splitk_gemm_prezero_tuned: A[M,K] @ B[N,K]^T, K mismatch");
-    TORCH_CHECK(C.size(0) == M && C.size(1) == N, "C must be [M,N]");
+    TORCH_CHECK(C.size(0) >= M && C.size(1) == N, "C must have shape [>=M,N]");
     auto* a = reinterpret_cast<const bf16*>(A.data_ptr());
     auto* b = reinterpret_cast<const bf16*>(B.data_ptr());
     auto* c = reinterpret_cast<bf16*>(C.data_ptr());

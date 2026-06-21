@@ -1603,12 +1603,34 @@ __global__ void __launch_bounds__(1024, 1)
                                    OutT* __restrict__ output,
                                    T* __restrict__ weight,
                                    float* __restrict__ scale_out,
+                                   T* __restrict__ gemm_zero,
+                                   int gemm_zero_elems,
                                    int size,
                                    int hidden_dim,
                                    float eps)
 {
     constexpr int pack_size = 16 / sizeof(T);
     int block_size          = hidden_dim / pack_size;
+    int token_num           = size / hidden_dim;
+    if((int)blockIdx.x >= token_num)
+    {
+        if(gemm_zero != nullptr)
+        {
+            using P = typename opus::vector_t<T, pack_size>;
+            P zero{};
+            int zero_block = (int)blockIdx.x - token_num;
+            int pack_idx = zero_block * (int)blockDim.x + (int)threadIdx.x;
+            int elem_idx = pack_idx * pack_size;
+            if(elem_idx + pack_size <= gemm_zero_elems)
+                *reinterpret_cast<P*>(gemm_zero + elem_idx) = zero;
+            else
+            {
+                for(int i = elem_idx; i < gemm_zero_elems; ++i)
+                    gemm_zero[i] = downcast_s<T>(0.0f);
+            }
+        }
+        return;
+    }
     bool active             = (int)threadIdx.x < block_size;
     using P                 = typename opus::vector_t<T, pack_size>;
     using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
@@ -1792,7 +1814,9 @@ void allreduce_fusion_kernel_1stage_launcher(RankData* _dp,
                                              int size,
                                              int hidden_dim,
                                              float eps,
-                                             hipStream_t stream)
+                                             hipStream_t stream,
+                                             T* gemm_zero = nullptr,
+                                             int gemm_zero_elems = 0)
 {
     constexpr int PACK_SIZE  = 16 / sizeof(T);
     constexpr int WARP_SIZE  = 32;
@@ -1804,7 +1828,10 @@ void allreduce_fusion_kernel_1stage_launcher(RankData* _dp,
         throw std::runtime_error(
             "Token number is too large for allreduce_fusion_kernel_1stage kernel");
     dim3 threadsPerBlock(LAUNCH_THREADS);
-    dim3 numBlocks(token_num);
+    int zeroBlocks = 0;
+    if(gemm_zero != nullptr && gemm_zero_elems > 0)
+        zeroBlocks = (gemm_zero_elems + PACK_SIZE * LAUNCH_THREADS - 1) / (PACK_SIZE * LAUNCH_THREADS);
+    dim3 numBlocks(token_num + zeroBlocks);
     allreduce_fusion_kernel_1stage<T, OutT, NGPUS>
         <<<numBlocks, threadsPerBlock, 0, stream>>>(_dp,
                                                     sg,
@@ -1815,6 +1842,8 @@ void allreduce_fusion_kernel_1stage_launcher(RankData* _dp,
                                                     output,
                                                     weight,
                                                     scale_out,
+                                                    gemm_zero,
+                                                    gemm_zero_elems,
                                                     size,
                                                     hidden_dim,
                                                     eps);
@@ -3111,7 +3140,9 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
                                    float eps,
                                    int m,
                                    int n,
-                                   bool use_1stage)
+                                   bool use_1stage,
+                                   T* gemm_zero = nullptr,
+                                   int gemm_zero_elems = 0)
 {
     auto d   = 16 / sizeof(T);
     int size = m * n;
@@ -3145,7 +3176,9 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
                                                              size,                 \
                                                              n,                    \
                                                              eps,                  \
-                                                             stream);              \
+                                                             stream,               \
+                                                             gemm_zero,            \
+                                                             gemm_zero_elems);     \
         return;                                                                    \
     }
 

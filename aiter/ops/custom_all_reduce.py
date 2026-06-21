@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import List
+from typing import List, Optional
 
 import torch
 
@@ -76,6 +76,7 @@ def fused_allreduce_rmsnorm(
     reg_ptr: int,
     reg_bytes: int,
     use_1stage: bool,
+    gemm_zero: Optional[torch.Tensor] = None,
 ) -> None: ...
 
 

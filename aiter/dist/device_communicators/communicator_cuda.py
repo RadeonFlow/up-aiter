@@ -3,6 +3,8 @@
 
 
 import os
+from typing import Optional
+
 import torch
 from torch.distributed import ProcessGroup
 
@@ -199,6 +201,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         weight_,
         eps,
         prefill_support: bool = False,
+        gemm_zero: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         n = input_.shape[-1]
         total_bytes = input_.numel() * input_.element_size()
@@ -218,10 +221,12 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 else (total_bytes <= 128 * 1024)
             )
             out, res_out = ca_comm.custom_fused_ar_rms(
-                input_, res_inp_, weight_, eps, use_1stage
+                input_, res_inp_, weight_, eps, use_1stage, gemm_zero=gemm_zero
             )
             assert out is not None
             assert res_out is not None
+            if gemm_zero is not None and not use_1stage:
+                gemm_zero.zero_()
             return out, res_out
         # call split kernel
         ar_out = self.all_reduce(input_, prefill_support=prefill_support)
@@ -238,6 +243,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             eps,
             0,
         )
+        if gemm_zero is not None:
+            gemm_zero.zero_()
         return out, residual_out
 
     def fused_allreduce_rmsnorm_quant(

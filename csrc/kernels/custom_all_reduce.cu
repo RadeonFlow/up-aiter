@@ -18,6 +18,7 @@
 #include "aiter_stream.h"
 #include "aiter_tensor.h"
 #include <cstring>
+#include <optional>
 
 using fp8_type = opus::fp8_t;
 
@@ -194,7 +195,9 @@ static void _fused_allreduce_rmsnorm(fptr_t _fa,
                                      void* scale_out, void* w,
                                      AiterDtype dtype, float eps,
                                      int m, int n,
-                                     bool use_1stage)
+                                     bool use_1stage,
+                                     void* gemm_zero,
+                                     int gemm_zero_elems)
 {
     hipStream_t stream = aiter::getCurrentHIPStream();
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
@@ -213,7 +216,9 @@ static void _fused_allreduce_rmsnorm(fptr_t _fa,
             eps,                                                 \
             m,                                                   \
             n,                                                   \
-            use_1stage);                                         \
+            use_1stage,                                          \
+            reinterpret_cast<DTYPE*>(gemm_zero),                 \
+            gemm_zero_elems);                                    \
     }                                                            \
     else                                                         \
     {                                                            \
@@ -451,7 +456,8 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
                              const aiter_tensor_t& w,
                              double eps,
                              int64_t reg_ptr, int64_t reg_bytes,
-                             bool use_1stage)
+                             bool use_1stage,
+                             std::optional<aiter_tensor_t> gemm_zero)
 {
     HipDeviceGuard device_guard(inp.device_id);
     hipStream_t stream = aiter::getCurrentHIPStream();
@@ -460,6 +466,8 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
     int64_t data_bytes = numel * inp.element_size();
     int n = (int)w.numel();
     int m = (int)(numel / w.numel());
+    void* gemm_zero_ptr = gemm_zero.has_value() ? gemm_zero->data_ptr() : nullptr;
+    int gemm_zero_elems = gemm_zero.has_value() ? (int)gemm_zero->numel() : 0;
 
     if(reg_ptr != 0)
     {
@@ -470,14 +478,16 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
         _fused_allreduce_rmsnorm(_fa,
                                  (void*)reg_ptr, res_inp.data_ptr(), res_out.data_ptr(),
                                  out.data_ptr(), nullptr, w.data_ptr(),
-                                 dtype, (float)eps, m, n, use_1stage);
+                                 dtype, (float)eps, m, n, use_1stage,
+                                 gemm_zero_ptr, gemm_zero_elems);
     }
     else
     {
         _fused_allreduce_rmsnorm(_fa,
                                  inp.data_ptr(), res_inp.data_ptr(), res_out.data_ptr(),
                                  out.data_ptr(), nullptr, w.data_ptr(),
-                                 dtype, (float)eps, m, n, use_1stage);
+                                 dtype, (float)eps, m, n, use_1stage,
+                                 gemm_zero_ptr, gemm_zero_elems);
     }
 }
 
@@ -509,14 +519,14 @@ void fused_allreduce_rmsnorm_quant(fptr_t _fa,
         _fused_allreduce_rmsnorm(_fa,
                                  (void*)reg_ptr, res_inp.data_ptr(), res_out.data_ptr(),
                                  out.data_ptr(), scale_out.data_ptr(), w.data_ptr(),
-                                 dtype, (float)eps, m, n, use_1stage);
+                                 dtype, (float)eps, m, n, use_1stage, nullptr, 0);
     }
     else
     {
         _fused_allreduce_rmsnorm(_fa,
                                  inp.data_ptr(), res_inp.data_ptr(), res_out.data_ptr(),
                                  out.data_ptr(), scale_out.data_ptr(), w.data_ptr(),
-                                 dtype, (float)eps, m, n, use_1stage);
+                                 dtype, (float)eps, m, n, use_1stage, nullptr, 0);
     }
 }
 

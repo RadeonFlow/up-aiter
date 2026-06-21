@@ -3,6 +3,7 @@
 #pragma once
 
 #include "aiter_tensor.h"
+#include <optional>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
@@ -465,7 +466,8 @@ namespace py = pybind11;
           py::arg("eps"),                                                                      \
           py::arg("reg_ptr"),                                                                  \
           py::arg("reg_bytes"),                                                                \
-          py::arg("use_1stage"));                                                              \
+          py::arg("use_1stage"),                                                               \
+          py::arg("gemm_zero") = std::nullopt);                                                \
     m.def("fused_allreduce_rmsnorm_quant",                                                     \
           &aiter::fused_allreduce_rmsnorm_quant,                                               \
           py::arg("_fa"),                                                                      \

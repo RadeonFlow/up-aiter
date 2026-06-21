@@ -216,7 +216,9 @@ bf16gemm_mfma32_splitk_pk(const bf16* __restrict__ A, const bf16* __restrict__ B
     for(int p4 = 0; p4 < (BM * BN / 2) / 256; p4++){
         int p = tid + p4 * 256, row = p / (BN / 2), c0 = (p % (BN / 2)) * 2;   // c0 = even column in slab
         bhalf2_t v{ (__bf16)lds_f[row * BN + c0], (__bf16)lds_f[row * BN + c0 + 1] };
-        atomic_pk_add_bf16(&C[(mrow0 + row) * N + n0 + c0], v);
+        int global_m = mrow0 + row;
+        if(global_m < M)
+            atomic_pk_add_bf16(&C[global_m * N + n0 + c0], v);
     }
 }
 
