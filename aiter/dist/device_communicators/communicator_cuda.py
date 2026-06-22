@@ -225,8 +225,6 @@ class CudaCommunicator(DeviceCommunicatorBase):
             )
             assert out is not None
             assert res_out is not None
-            if gemm_zero is not None and not use_1stage:
-                gemm_zero.zero_()
             return out, res_out
         # call split kernel
         ar_out = self.all_reduce(input_, prefill_support=prefill_support)

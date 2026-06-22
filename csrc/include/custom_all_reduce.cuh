@@ -1200,7 +1200,10 @@ __global__ void __launch_bounds__(tnum, 1)
                                     float eps,
                                     int rank,
                                     int m,
-                                    int n)
+                                    int n,
+                                    T* __restrict__ gemm_zero,
+                                    int gemm_zero_elems,
+                                    int rms_grid_size)
 {
     constexpr int pack_size = 16 / sizeof(T);
     using P                 = typename opus::vector_t<T, pack_size>;
@@ -1208,7 +1211,26 @@ __global__ void __launch_bounds__(tnum, 1)
     __shared__ float smem[tnum];
     P* tmps = get_tmp_buf<P>(sg.signals[rank]);
 
-    for(int bid = blockIdx.x; bid < m; bid += gridDim.x)
+    if((int)blockIdx.x >= rms_grid_size)
+    {
+        if(gemm_zero != nullptr)
+        {
+            P zero{};
+            int zero_block = (int)blockIdx.x - rms_grid_size;
+            int pack_idx   = zero_block * (int)blockDim.x + (int)threadIdx.x;
+            int elem_idx   = pack_idx * pack_size;
+            if(elem_idx + pack_size <= gemm_zero_elems)
+                *reinterpret_cast<P*>(gemm_zero + elem_idx) = zero;
+            else
+            {
+                for(int i = elem_idx; i < gemm_zero_elems; ++i)
+                    gemm_zero[i] = downcast_s<T>(0.0f);
+            }
+        }
+        return;
+    }
+
+    for(int bid = blockIdx.x; bid < m; bid += rms_grid_size)
     {
         float square_sum = 0.0f;
         A rms_inp_f32[n_loop];
@@ -1270,7 +1292,10 @@ __global__ void __launch_bounds__(tnum, 1) local_device_load_rmsnorm(RankSignals
                                                                      float eps,
                                                                      int rank,
                                                                      int m,
-                                                                     int n)
+                                                                     int n,
+                                                                     T* __restrict__ gemm_zero,
+                                                                     int gemm_zero_elems,
+                                                                     int rms_grid_size)
 {
     constexpr int pack_size = 16 / sizeof(T);
     using P                 = typename opus::vector_t<T, pack_size>;
@@ -1278,7 +1303,26 @@ __global__ void __launch_bounds__(tnum, 1) local_device_load_rmsnorm(RankSignals
     __shared__ float smem[tnum];
     P* tmps = get_tmp_buf<P>(sg.signals[rank]);
 
-    for(int bid = blockIdx.x; bid < m; bid += gridDim.x)
+    if((int)blockIdx.x >= rms_grid_size)
+    {
+        if(gemm_zero != nullptr)
+        {
+            P zero{};
+            int zero_block = (int)blockIdx.x - rms_grid_size;
+            int pack_idx   = zero_block * (int)blockDim.x + (int)threadIdx.x;
+            int elem_idx   = pack_idx * pack_size;
+            if(elem_idx + pack_size <= gemm_zero_elems)
+                *reinterpret_cast<P*>(gemm_zero + elem_idx) = zero;
+            else
+            {
+                for(int i = elem_idx; i < gemm_zero_elems; ++i)
+                    gemm_zero[i] = downcast_s<T>(0.0f);
+            }
+        }
+        return;
+    }
+
+    for(int bid = blockIdx.x; bid < m; bid += rms_grid_size)
     {
         float square_sum = 0.0f;
         A rms_inp_f32[n_loop];
@@ -3221,8 +3265,15 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
     {                                                                           \
         auto kernel_ptr = reinterpret_cast<const void*>(template_kernel);       \
         setGrid(naive_grid_size, kernel_ptr);                                   \
+        int rms_grid_size = grid.x;                                             \
+        int zero_blocks = 0;                                                    \
+        if(gemm_zero != nullptr && gemm_zero_elems > 0)                         \
+            zero_blocks = (gemm_zero_elems + ar_pack_size * (int)block.x - 1) / \
+                          (ar_pack_size * (int)block.x);                       \
+        grid.x = rms_grid_size + zero_blocks;                                   \
         template_kernel<<<grid, block, 0, stream>>>(                            \
-            sg_, residual_inp, residual_out, output, weight, eps, rank_, m, n); \
+            sg_, residual_inp, residual_out, output, weight, eps, rank_, m, n,  \
+            gemm_zero, gemm_zero_elems, rms_grid_size);                         \
     } while(0)
 
     // n_packs = number of vectorized elements per row
