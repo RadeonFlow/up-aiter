@@ -25,6 +25,10 @@ from aiter.fused_moe import (
     torch_moe,
     cktile_moe_stage1,
     cktile_moe_stage2,
+    _mxfp4_a4w4_stage1_fw,
+    _mxfp4_a4w4_stage2_fw,
+    _parse_mxfp4_g1_kname,
+    _parse_mxfp4_g2_kname,
 )
 from aiter import ck_moe_stage1_fwd, ck_moe_stage2_fwd, dtype2str_dict
 from aiter.ops.shuffle import (
@@ -584,117 +588,117 @@ class FmoeTuner(TunerCommon):
         )
 
     @staticmethod
-    def run_opus_stage2_out(
-        a2_qt,
+    def _mxfp4_port_g1_kname(ne, h, e, bm, use_nt, inline_quant):
+        # Build a gemm1 kernel name matching the mxfp4 codegen/CSV grammar
+        # (see aiter.fused_moe._parse_mxfp4_g1_kname). BM16 is inline-quant
+        # (bare = NT/read-once, _CACHED = cached); BM32 cshuffle uses _NT/_CACHED;
+        # BM128 takes no variant suffix.
+        name = f"mxfp4_moe_g1_a4w4_NE{ne}_H{h}_E{e}_BM{bm}"
+        if inline_quant:
+            name += "_INLINEQUANT" + ("" if use_nt else "_CACHED")
+        elif bm == 32:
+            name += "_NT" if use_nt else "_CACHED"
+        return name
+
+    @staticmethod
+    def _mxfp4_port_g2_kname(ne, h, e, topk, bm, use_nt, epilog):
+        # Build a gemm2 kernel name matching the mxfp4 codegen/CSV grammar
+        # (see aiter.fused_moe._parse_mxfp4_g2_kname). epilog in
+        # {atomic, nonatomic, nonatomic_mxfp4, nonatomic_cshuffle}. atomic carries
+        # the TOPK tag and an optional _NT; nonatomic drops TOPK and may add
+        # _MXFP4OUT or _CSHUFFLE.
+        if epilog == "atomic":
+            name = f"mxfp4_moe_g2_a4w4_NE{ne}_H{h}_E{e}_TOPK{topk}_BM{bm}_ATOMIC"
+            if use_nt:
+                name += "_NT"
+            return name
+        name = f"mxfp4_moe_g2_a4w4_NE{ne}_H{h}_E{e}_BM{bm}_NONATOMIC"
+        if epilog == "nonatomic_mxfp4":
+            name += "_MXFP4OUT"
+        elif epilog == "nonatomic_cshuffle":
+            name += "_CSHUFFLE"
+        return name
+
+    @staticmethod
+    def run_mxfp4_port_stage1_out(
+        input,
+        w1_qt,
         w2_qt,
-        sorted_ids,
-        sorted_expert_ids,
-        sorted_weights,
-        num_valid_ids,
-        w2_scale,
-        a2_scale,
-        moe_buf,
-        bias,
+        w1_scale,
+        topk_ids,
+        topk_weights,
         dtype,
         topk,
-        kparams,
-        blockM,
-        q_type,
-        act_type,
+        ne,
+        h,
+        e,
+        kernelName1,
     ):
-        # opus a8w4 stage2 (gfx950 decode family). kparams from
-        # get_opus_a8w4_stage2_kernels: kid + kernel_block_m (B_M) + route_out.
-        # The tuner's blockM is the moe_sorting block_m (== the kid's
-        # SORT_BLOCK_M); the kernel's own B_M is kparams["kernel_block_m"].
-        from aiter.ops.opus.moe_stage2_a8w4 import (
-            opus_moe_stage2_a8w4_decode_fwd,
-            opus_moe_stage2_reduce_token_slot_route_output_fwd,
+        # Time gemm1 of the FlyDSL mxfp4 a4w4 port via its production stage entry
+        # (_mxfp4_a4w4_stage1_fw). Weights take the a16w4 layout the port expects
+        # (shuffle_weight_a16w4 / shuffle_scale_a16w4); the fused HIP sort emits the
+        # m_indices the port's gemm1 consumes.
+        BM = _parse_mxfp4_g1_kname(kernelName1)["BM"]
+        p2_atomic = False  # stage1 sort doesn't accumulate; BM-only sort layout
+        w1_a16 = shuffle_weight_a16w4(w1_qt, 16, True)
+        w1s_a16 = shuffle_scale_a16w4(w1_scale, ne, True)
+        sti, sw, sei, nvi, moe_buf, aux = moe_sorting(
+            topk_ids, topk_weights, ne, h, dtype,
+            block_size=BM, accumulate=p2_atomic, fused_sort=True,
         )
-        from aiter.ops.opus.moe_stage2_a8w4_meta import (
-            OPUS_A8W4_DEFAULT_SHAPE_FAMILY_CONTRACT,
-            opus_a8w4_shape_family,
-            opus_a8w4_shape_family_for_shape,
+        inter_q, inter_s = _mxfp4_a4w4_stage1_fw(
+            input, w1_a16, w2_qt, sti, sei, nvi, None, topk,
+            block_m=BM, w1_scale=w1s_a16, kernelName1=kernelName1,
+            m_indices=aux.m_indices, moe_buf=moe_buf,
         )
+        return inter_q
 
-        shape_family = opus_a8w4_shape_family(
-            kparams.get("shape_family", OPUS_A8W4_DEFAULT_SHAPE_FAMILY_CONTRACT.name)
+    @staticmethod
+    def run_mxfp4_port_stage2_out(
+        input,
+        w1_qt,
+        w2_qt,
+        w1_scale,
+        w2_scale,
+        topk_ids,
+        topk_weights,
+        dtype,
+        topk,
+        ne,
+        h,
+        e,
+        kernelName1,
+        kernelName2,
+    ):
+        # Time gemm2 of the FlyDSL mxfp4 a4w4 port. gemm2 consumes the gemm1
+        # intermediate, so run stage1 first (untimed setup is unavoidable here),
+        # then time stage2 (_mxfp4_a4w4_stage2_fw). reverse_sorted comes from the
+        # fused HIP sort and feeds the port's scatter_reduce.
+        BM = _parse_mxfp4_g2_kname(kernelName2)["BM"]
+        atomic = _parse_mxfp4_g2_kname(kernelName2)["atomic"]
+        BM1 = _parse_mxfp4_g1_kname(kernelName1)["BM"]
+        w1_a16 = shuffle_weight_a16w4(w1_qt, 16, True)
+        w1s_a16 = shuffle_scale_a16w4(w1_scale, ne, True)
+        w2_a16 = shuffle_weight_a16w4(w2_qt, 16, False)
+        w2s_a16 = shuffle_scale_a16w4(w2_scale, ne, False)
+        M = input.shape[0]
+        sti, sw, sei, nvi, moe_buf, aux = moe_sorting(
+            topk_ids, topk_weights, ne, h, dtype,
+            block_size=BM, accumulate=atomic, fused_sort=True,
         )
-        if shape_family is None:
-            shape_family = opus_a8w4_shape_family_for_shape(
-                model_dim=w2_qt.shape[1],
-                inter_dim=a2_qt.shape[-1],
-                expert=w2_qt.shape[0],
-                topk=topk,
-                block_n=kparams.get("kernel_block_n"),
-            )
-        if shape_family is None:
-            raise ValueError(
-                "unsupported Opus A8W4 shape family: "
-                f"shape_family={kparams.get('shape_family')}"
-            )
-        if not shape_family.matches(
-            model_dim=w2_qt.shape[1],
-            inter_dim=a2_qt.shape[-1],
-            expert=w2_qt.shape[0],
-            topk=topk,
-            block_n=kparams.get("kernel_block_n"),
-        ):
-            raise ValueError(
-                "Opus A8W4 stage2 candidate does not match shape family "
-                f"{shape_family.name}: model_dim={w2_qt.shape[1]}, "
-                f"inter_dim={a2_qt.shape[-1]}, expert={w2_qt.shape[0]}, "
-                f"topk={topk}, block_n={kparams.get('kernel_block_n')}"
-            )
-        kid = kparams["kid"]
-        kbm = kparams["kernel_block_m"]
-        reduce_block_n = kparams.get("reduce_block_n")
-        # w2_qt / w2_scale here are ALREADY the a16w4 MFMA-tile shuffle:
-        # gen_opus_2stages_task feeds "w2_qt_shffle_ck" (shuffle_weight_a16w4)
-        # and "w2_scale_aiter" (shuffle_scale_a16w4). opus consumes them as-is.
-        # The family inter pad was zeroed on the raw weight BEFORE shuffling
-        # (generate_data_2stages), so opus and the torch ref both use the
-        # family's effective inter dim. Verified cosine ~3e-4.
-        w2_use = w2_qt
-        w2_scale_opus = w2_scale
-        if kparams["route_out"]:
-            route_out = opus_moe_stage2_a8w4_decode_fwd(
-                a2_qt,
-                w2_use,
-                a2_scale,
-                w2_scale_opus,
-                sorted_ids,
-                sorted_weights,
-                sorted_expert_ids,
-                num_valid_ids,
-                block_m=kbm,
-                kernel_id=kid,
-                inter_dim_pad=shape_family.inter_dim_pad,
-                return_per_slot=True,
-            )
-            if route_out.dtype == torch.uint8:  # MXFP8 route_out
-                return opus_moe_stage2_reduce_token_slot_route_output_fwd(
-                    route_out, out=moe_buf, topk=int(topk), block_n=reduce_block_n
-                )
-            return opus_moe_stage2_reduce_token_slot_route_output_fwd(
-                route_out.view(moe_buf.shape[0], int(topk), moe_buf.shape[1]),
-                out=moe_buf,
-                topk=int(topk),
-                block_n=reduce_block_n,
-            )
-        moe_buf.zero_()
-        return opus_moe_stage2_a8w4_decode_fwd(
-            a2_qt,
-            w2_use,
-            a2_scale,
-            w2_scale_opus,
-            sorted_ids,
-            sorted_weights,
-            sorted_expert_ids,
-            num_valid_ids,
-            out=moe_buf,
-            block_m=kbm,
-            kernel_id=kid,
-            inter_dim_pad=shape_family.inter_dim_pad,
+        moe_out = (
+            moe_buf if moe_buf.numel() else torch.empty((M, h), dtype=dtype)
+        )
+        inter_q, inter_s = _mxfp4_a4w4_stage1_fw(
+            input, w1_a16, w2_a16, sti, sei, nvi, None, topk,
+            block_m=BM1, w1_scale=w1s_a16, kernelName1=kernelName1,
+            m_indices=aux.m_indices, moe_buf=moe_buf,
+        )
+        return _mxfp4_a4w4_stage2_fw(
+            inter_q, w1_a16, w2_a16, sti, sei, nvi, moe_out, topk,
+            w2_scale=w2s_a16, a2_scale=inter_s, block_m=BM,
+            sorted_weights=sw, kernelName2=kernelName2,
+            reverse_sorted=aux.reverse_sorted,
         )
 
     @staticmethod
@@ -3033,14 +3037,17 @@ class FmoeTuner(TunerCommon):
 
         return tasks_flydsl
 
-    def gen_opus_2stages_task(self, info, blockMs):
-        # opus a8w4 stage2 candidates. Stage2-only:
-        # the tuner pairs each opus kid with the best stage1 and keeps the
-        # lowest-us combo. opus takes the a16w4 MFMA shuffle (w2_qt_shffle_ck /
-        # w2_scale_aiter, same as ck) and computes the family's effective
-        # inter dim, so its ref is run_torch_moe_stage2_opus_eff. Inputs verified
-        # cosine ~3e-4; raw=0.94 and shuffle-without-slice=0.14 are wrong.
-        tasks_opus = []
+    def gen_mxfp4_port_2stages_task(self, info, blockMs):
+        # Enumerate the FlyDSL mxfp4 a4w4 *port* (mxfp4_moe_g{1,2}_a4w4_*) as tuner
+        # candidates, alongside the generic flydsl_moe* engine. Only a4w4
+        # (per_1x32, fp4 act + fp4 weight) is served by the port. Candidates are
+        # timing-only (ref_func=None under fast_mode): correctness is covered by
+        # the standalone e2e tests (test_mxfp4_moe_*), and the port's sorted/a16w4
+        # intermediate layout doesn't line up with the torch stage reference for a
+        # cheap elementwise compare.
+        tasks_port = []
+        if not is_flydsl_available():
+            return tasks_port
         (
             gfx,
             cu_num,
@@ -3058,114 +3065,93 @@ class FmoeTuner(TunerCommon):
             doweight_stage1,
         ) = info
 
-        from aiter.ops.opus.moe_stage2_a8w4_meta import (
-            get_opus_a8w4_stage2_kernels,
-            opus_a8w4_shape_family_for_shape,
-        )
-
-        shape_family = opus_a8w4_shape_family_for_shape(
-            model_dim=model_dim,
-            inter_dim=inter_dim,
-            expert=expert,
-            topk=topk,
-        )
-        # gfx950 + a8w4 (fp8 act / fp4 weight / per_1x32) + g1u1 + supported
-        # shape family. Kids are filtered by their bound shape family below.
-        if not (
-            gfx == "gfx950"
-            and use_g1u1
-            and q_type == QuantType.per_1x32
-            and q_dtype_a == dtypes.fp8
-            and q_dtype_w == dtypes.fp4x2
-            and shape_family is not None
+        if (
+            q_type != QuantType.per_1x32
+            or q_dtype_a != dtypes.fp4x2
+            or q_dtype_w != dtypes.fp4x2
+            or not use_g1u1
         ):
-            return tasks_opus
+            return tasks_port
 
-        # fp8-activation stage2 ref (shape-level, shared by all opus kids): torch
-        # stage2 on the bf16 stage1 output, sliced by opus_eff to match the family.
-        s2_ref_args = (
-            [
-                "ref1_bf16",
-                "w1_qt",
-                "w2_qt",
-                "topk_weights",
-                "topk_ids",
-                "a2_scale_none",
-                "w2_scale",
-                "bias",
-            ],
-            dtype,
-            q_type,
-            doweight_stage1,
-        )
-        run_keys = [
-            "a2_qt",
-            "w2_qt_shffle_ck",
-            "sorted_ids",
-            "sorted_expert_ids",
-            "sorted_weights",
-            "num_valid_ids",
-            "w2_scale_aiter",
-            "a2_scale_mxfp4_sort",
-            "moe_buf",
-            "bias",
-        ]
+        from aiter.ops.flydsl.mxfp4_gemm1_kernels import _SUPPORTED as _G1_SUPPORTED
+        from aiter.ops.flydsl.mxfp4_gemm2_kernels import _SUPPORTED as _G2_SUPPORTED
+
+        ne, h, e = expert, model_dim, inter_dim
+
+        # The port wants the raw mxfp4 inputs (bf16 hidden + clean fp4/e8m0
+        # weights), which the low-level generate_data returns directly -- unlike
+        # generate_data_2stages, whose a4w4 a1_qt is already fp4-quantized.
+        def _gen_args():
+            return (
+                token, model_dim, inter_dim, expert, topk, dtype,
+                q_dtype_a, q_dtype_w, q_type, use_g1u1, blockM,
+            )
 
         for blockM in blockMs:
-            if blockM not in (16, 32, 64, 128):
-                continue
-            for kname, kparams in get_opus_a8w4_stage2_kernels(
-                shape_family=shape_family.name,
-                token=token,
-            ).items():
-                # tuner blockM is the moe_sorting block_m; valid only when it
-                # equals the kid's SORT_BLOCK_M.
-                if kparams["sort_block_m"] != blockM:
+            # ---- stage1 (gemm1) candidates ----
+            for bm, use_nt, inline_quant in sorted(_G1_SUPPORTED):
+                if bm != blockM:
                     continue
-                if not shape_family.matches(
-                    model_dim=model_dim,
-                    inter_dim=inter_dim,
-                    expert=expert,
-                    topk=topk,
-                    block_n=kparams.get("kernel_block_n"),
-                ):
-                    continue
-                gen_args = (
-                    token,
-                    model_dim,
-                    inter_dim,
-                    expert,
-                    topk,
-                    act_type,
-                    dtype,
-                    q_dtype_a,
-                    q_dtype_w,
-                    q_type,
-                    use_g1u1,
-                    doweight_stage1,
-                    blockM,
-                    2,
-                )
-                run_args = (run_keys, dtype, topk, kparams, blockM, q_type, act_type)
-                tasks_opus.append(
+                kn1 = self._mxfp4_port_g1_kname(ne, h, e, bm, use_nt, inline_quant)
+                tasks_port.append(
                     (
-                        (info, "stage2", kname, blockM),
-                        FmoeTuner.generate_data_2stages,
-                        gen_args,
-                        FmoeTuner.run_opus_stage2_out,
-                        run_args,
+                        (info, "stage1", kn1, blockM),
+                        FmoeTuner.generate_data,
+                        _gen_args(),
+                        FmoeTuner.run_mxfp4_port_stage1_out,
+                        (
+                            ["input", "w1_qt", "w2_qt", "w1_scale",
+                             "topk_ids", "topk_weights"],
+                            dtype, topk, ne, h, e, kn1,
+                        ),
                         {},
-                        FmoeTuner.run_torch_moe_stage2_opus_eff,
-                        s2_ref_args,
+                        None,
+                        (),
                         {},
                         None,
                         0.01,
                         0.01,
-                        cosine_diff_compare,
+                        None,
                     )
                 )
 
-        return tasks_opus
+            # ---- stage2 (gemm2) candidates ----
+            for bm, use_nt, epilog in sorted(_G2_SUPPORTED):
+                if bm != blockM:
+                    continue
+                # gemm1 for the stage2 setup: pick a supported g1 variant at this BM
+                # (BM16 -> inline_quant; BM32 -> cshuffle NT; BM128 -> plain).
+                g1_match = [
+                    (b, n, iq) for (b, n, iq) in _G1_SUPPORTED if b == bm
+                ]
+                if not g1_match:
+                    continue
+                b1, n1, iq1 = sorted(g1_match)[0]
+                kn1 = self._mxfp4_port_g1_kname(ne, h, e, b1, n1, iq1)
+                kn2 = self._mxfp4_port_g2_kname(ne, h, e, topk, bm, use_nt, epilog)
+                tasks_port.append(
+                    (
+                        (info, "stage2", kn2, blockM),
+                        FmoeTuner.generate_data,
+                        _gen_args(),
+                        FmoeTuner.run_mxfp4_port_stage2_out,
+                        (
+                            ["input", "w1_qt", "w2_qt", "w1_scale", "w2_scale",
+                             "topk_ids", "topk_weights"],
+                            dtype, topk, ne, h, e, kn1, kn2,
+                        ),
+                        {},
+                        None,
+                        (),
+                        {},
+                        None,
+                        0.01,
+                        0.01,
+                        None,
+                    )
+                )
+
+        return tasks_port
 
     def gen_flydsl_i4_2stages_task(self, info, blockMs):
         tasks_flydsl = []
@@ -3741,32 +3727,12 @@ class FmoeTuner(TunerCommon):
                 use_g1u1,
                 doweight_stage1,
             )
-            _opus_only = os.environ.get("OPUS_ONLY", "0") == "1"
-            # TUNE_ONLY: comma-list subset gate to isolate sources, e.g.
-            #   TUNE_ONLY=flydsl  -> only gen_flydsl_2stages_task
-            #   TUNE_ONLY=opus    -> only gen_opus_2stages_task
-            # empty = all (subject to OPUS_ONLY / OPUS_SKIP_CKTILE below).
-            _tune_only = set(s for s in os.environ.get("TUNE_ONLY", "").split(",") if s)
-
-            def _want(name):
-                if _tune_only:
-                    return name in _tune_only
-                if _opus_only:
-                    return name == "opus"
-                return True
-
-            if _want("asm"):
-                tasks.extend(self.gen_2stages_asm1_task(info, blockMs))
-            if _want("cktile") and os.environ.get("OPUS_SKIP_CKTILE", "0") != "1":
-                tasks_ck.extend(self.gen_2stages_task(info, blockMs))
-            if _want("flydsl"):
-                tasks_ck.extend(self.gen_flydsl_2stages_task(info, blockMs))
-            if _want("flydsli4"):
-                tasks_ck.extend(self.gen_flydsl_i4_2stages_task(info, blockMs))
-            if _want("opus"):
-                tasks_ck.extend(self.gen_opus_2stages_task(info, blockMs))
-            if _want("asm"):
-                task_1stage.extend(self.gen_1stage_asm_task(info))
+            tasks.extend(self.gen_2stages_asm1_task(info, blockMs))
+            tasks_ck.extend(self.gen_2stages_task(info, blockMs))
+            tasks_ck.extend(self.gen_flydsl_2stages_task(info, blockMs))
+            tasks_ck.extend(self.gen_mxfp4_port_2stages_task(info, blockMs))
+            tasks_ck.extend(self.gen_flydsl_i4_2stages_task(info, blockMs))
+            task_1stage.extend(self.gen_1stage_asm_task(info))
             if tasks is None and tasks_ck is None and task_1stage is None:
                 print("no moe solution can tune for ", line)
                 continue
