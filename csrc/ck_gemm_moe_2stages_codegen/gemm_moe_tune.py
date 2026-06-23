@@ -44,6 +44,7 @@ from aiter.int4_utils import (
     convert_int8_to_uint32_int4,
 )
 from aiter.ops.quant import per_1x32_i4_quant, per_1x32_f8_scale_f8_quant
+from aiter.ops.flydsl.moe_common import GateMode
 from aiter import dtypes
 from aiter import ActivationType as ActivationType
 from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime, gfx_from_cu_num
@@ -3532,9 +3533,9 @@ class FmoeTuner(TunerCommon):
                     )
                 elif (
                     q_type == QuantType.per_1x32
-                    and q_dtype_a in [dtypes.bf16, dtypes.fp16, dtypes.fp8]
+                    and q_dtype_a in [dtypes.bf16, dtypes.fp16, dtypes.fp8, dtypes.fp4x2]
                     and q_dtype_w == dtypes.fp4x2
-                ):
+                ):  # a16w4 / a8w4 / a4w4 — all use the gate-up-interleaved a16w4 layout
                     w1_qt_fmoe = shuffle_weight_a16w4(w1_qt_fmoe, 16, True)
                     w1_scale_fmoe = shuffle_scale_a16w4(w1_scale, expert, True)
                     w2_qt_fmoe = shuffle_weight_a16w4(w2_qt_fmoe, 16, False)
@@ -3589,6 +3590,17 @@ class FmoeTuner(TunerCommon):
                     torch_quant = aiter.get_torch_quant(q_type)
                     a1_qt, a1_scale = torch_quant(hidden, quant_dtype=q_dtype_a)
 
+                # mxfp4 weights (a4w4/a8w4/a16w4) and mxfp8 (a8w8) run the
+                # gate-up-interleaved layout the tuned rows are keyed on
+                # (matches serving ATOM_MOE_GU_ITLV=1); everything else stays
+                # separated. Mirror op_tests/test_moe_2stage._effective_gate_mode.
+                if (
+                    q_dtype_a in [dtypes.fp8, dtypes.bf16, dtypes.fp4x2]
+                    and q_dtype_w == dtypes.fp4x2
+                ) or (q_dtype_a == dtypes.fp8 and q_dtype_w == dtypes.fp8):
+                    gate_mode = GateMode.INTERLEAVE.value
+                else:
+                    gate_mode = GateMode.SEPARATED.value
                 out, us = run_perftest(
                     fused_moe,
                     hidden,
@@ -3602,6 +3614,7 @@ class FmoeTuner(TunerCommon):
                     w1_scale=w1_scale_fmoe,
                     w2_scale=w2_scale_fmoe,
                     dtype=dtype,
+                    gate_mode=gate_mode,
                     num_warmup=args.warmup,
                     num_iters=args.iters,
                 )
