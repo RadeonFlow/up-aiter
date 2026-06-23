@@ -1057,7 +1057,6 @@ def _flat_mxfp4_epilog(
     n_lane = tid_i32 % fx.Int32(16)
     wave_grp = n_lane // fx.Int32(4)
     kk = n_lane % fx.Int32(4)
-    i7fff = _raw(fx.Int32(0x7FFFFFFF))
     _m_base = m_row + m_lane
     _q_row0 = fx.Int64(_m_base) * fx.Int64(N_OUT // 2)
     _s_row0 = fx.Int64(_m_base) * fx.Int64(N_OUT // 32)
