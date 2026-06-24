@@ -19,7 +19,7 @@ _SUPPORTED = {
 
 @functools.cache
 def _get_compiled_mxfp4_gemm1_port(
-    BM, use_nt, inline_quant, D_HIDDEN, D_INTER, NE, topk, BN, BK
+    BM, use_nt, inline_quant, D_HIDDEN, D_INTER, NE, topk, interleave=True
 ):
     from .kernels.mxfp4_gemm1 import compile_gemm1_a4w4_port
 
@@ -31,8 +31,7 @@ def _get_compiled_mxfp4_gemm1_port(
         D_INTER=D_INTER,
         NE=NE,
         TOPK=topk,
-        BN=BN,
-        BK=BK,
+        interleave=interleave,
     )
 
 
@@ -75,8 +74,7 @@ def flydsl_mxfp4_gemm1(
     D_HIDDEN,
     D_INTER,
     topk,
-    BN=256,
-    BK=256,
+    interleave=True,
     stream=None,
 ):
     _assert_supported(
@@ -93,7 +91,7 @@ def flydsl_mxfp4_gemm1(
     from .kernels.mxfp4_gemm1 import gemm1_grid
 
     launch = _get_compiled_mxfp4_gemm1_port(
-        BM, use_nt, inline_quant, D_HIDDEN, D_INTER, NE, topk, BN, BK
+        BM, use_nt, inline_quant, D_HIDDEN, D_INTER, NE, topk, interleave
     )
     grid = gemm1_grid(n_tokens, BM, NE=NE, TOPK=topk, INTER=D_INTER, BN=BN)
     _moe_kernels._run_compiled(

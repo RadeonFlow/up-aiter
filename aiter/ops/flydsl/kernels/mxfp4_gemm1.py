@@ -127,19 +127,21 @@ def _gemm1_body(
     kSubBlocks,
     kMChunks,
     inline_quant=False,
-    K,
-    K_HALF,
-    K_TILES_TOTAL,
-    kUnroll,
-    kAS_per_chunk_dw,
-    kBS_stride_n0_dw,
-    kBS_per_expert_dw,
-    BQ_BYTES,
-    BSCALE_BYTES,
-    N_OUT,
-    NUM_N_BLOCKS,
-    OUT_AS_PER_CHUNK_DW,
-    K_G2_HALF,
+    K=K,
+    K_HALF=K_HALF,
+    K_TILES_TOTAL=K_TILES_TOTAL,
+    kUnroll=kUnroll,
+    kAS_per_chunk_dw=kAS_per_chunk_dw,
+    kBS_stride_n0_dw=kBS_stride_n0_dw,
+    kBS_per_expert_dw=kBS_per_expert_dw,
+    BQ_BYTES=BQ_BYTES,
+    ASCALE_BYTES=ASCALE_BYTES,
+    BSCALE_BYTES=BSCALE_BYTES,
+    N_OUT=N_OUT,
+    NUM_N_BLOCKS=NUM_N_BLOCKS,
+    OUT_AS_PER_CHUNK_DW=OUT_AS_PER_CHUNK_DW,
+    K_G2_HALF=K_G2_HALF,
+    interleave=True,
 ):
     BN_INT = BN // 2
     b_aux = 2 if use_nt else 0
@@ -197,14 +199,22 @@ def _gemm1_body(
                 llvm.load(T.i32, _global_ptr1(arg_mind, idx * fx.Int32(4)))
             )
 
+    # -- b_load_s_base[j] (HIP 412-416), readfirstlane'd uniform per wave ------
+    N0_HALF = N_OUT // 32
     b_load_s_base = []
     for j in range_constexpr(4):
-        v = (
-            e * fx.Int32(N_OUT)
-            + n_block_idx * fx.Int32(BN)
-            + wave * fx.Int32(BN // 4)
-            + fx.Int32(j * 16)
-        ) * fx.Int32(K_HALF)
+        if const_expr(interleave):
+            col = (
+                n_block_idx * fx.Int32(BN)
+                + wave * fx.Int32(BN // 4)
+                + fx.Int32(j * 16)
+            )
+        else:
+            tile_il = n_block_idx * fx.Int32(16) + wave * fx.Int32(4) + fx.Int32(j)
+            g = tile_il & fx.Int32(1)
+            n0 = tile_il >> fx.Int32(1)
+            col = (g * fx.Int32(N0_HALF) + n0) * fx.Int32(16)
+        v = (e * fx.Int32(N_OUT) + col) * fx.Int32(K_HALF)
         b_load_s_base.append(rocdl.readfirstlane(T.i32, v))
 
     mni_base = n_block_idx * fx.Int32(BN // 16 // 2) + wave * fx.Int32(BN // 64 // 2)
@@ -732,18 +742,16 @@ def compile_gemm1_a4w4_port(
     BM=32,
     use_nt=True,
     inline_quant=False,
-    *,
-    D_HIDDEN,
-    D_INTER,
-    NE,
-    TOPK,
-    BN=256,
-    BK=256,
+    D_HIDDEN=K,
+    D_INTER=INTER,
+    NE=NE,
+    TOPK=TOPK,
+    interleave=True,
 ):
     print(
         f"[PORT-FLYDSL-GEMM1] compile_gemm1_a4w4_port ENTERED "
         f"BM={BM} use_nt={use_nt} inline_quant={inline_quant} "
-        f"D_HIDDEN={D_HIDDEN} D_INTER={D_INTER} NE={NE}",
+        f"D_HIDDEN={D_HIDDEN} D_INTER={D_INTER} NE={NE} interleave={interleave}",
         flush=True,
     )
     if (BM, use_nt, inline_quant) not in {
@@ -784,7 +792,10 @@ def compile_gemm1_a4w4_port(
     )
 
     variant_tag = "iq" if inline_quant else ("nt" if use_nt else "cached")
-    name_suffix = f"h{_K}_i{_INTER}_ne{_NE}_bm{BM}_{variant_tag}"
+    # Tag with H/INTER/NE so different shape specializations get distinct
+    # kernel/smem symbols (so KIMI and non-KIMI instances never collide).
+    gu_tag = "il" if interleave else "sep"
+    name_suffix = f"h{_K}_i{_INTER}_ne{_NE}_bm{BM}_{variant_tag}_{gu_tag}"
 
     allocator = SmemAllocator(
         None, arch="gfx950", global_sym_name=f"gemm1port_smem_{name_suffix}"
@@ -857,6 +868,7 @@ def compile_gemm1_a4w4_port(
                 NUM_N_BLOCKS=_NUM_N_BLOCKS,
                 OUT_AS_PER_CHUNK_DW=_OUT_AS_PER_CHUNK_DW,
                 K_G2_HALF=_K_G2_HALF,
+                interleave=interleave,
             )
 
     @flyc.jit
