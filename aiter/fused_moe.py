@@ -173,7 +173,6 @@ def _hip_moe_sort(
     num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
     sorted_weights = torch.empty(max_sorted, dtype=dtypes.fp32, device=device)
     reverse_sorted = torch.empty(M * topk, dtype=dtypes.i32, device=device)
-    masked_m = torch.empty(num_experts, dtype=dtypes.i32, device=device)
     m_indices = torch.empty(max_sorted, dtype=dtypes.i32, device=device)
     moe_buf = (
         torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
@@ -191,7 +190,6 @@ def _hip_moe_sort(
         cumsum_tensor=num_valid_ids,
         reverse_sorted=reverse_sorted,
         sorted_weights=sorted_weights,
-        masked_m=masked_m,
         m_indices=m_indices,
         bf16_zero_out=bf16_zero,
         bf16_zero_workspace=empty_bf16,
