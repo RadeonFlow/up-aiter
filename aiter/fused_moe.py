@@ -52,16 +52,6 @@ _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
 
-# Log the a4w4 gemm backend once (avoids per-call spam).
-_MXFP4_BACKEND_LOGGED: set = set()
-
-
-def _log_mxfp4_backend_once(backend: str):
-    if backend not in _MXFP4_BACKEND_LOGGED:
-        _MXFP4_BACKEND_LOGGED.add(backend)
-        logger.info(f"[fused_moe] mxfp4 a4w4 MoE gemm backend = {backend}")
-
-
 # FLAT 1stage asm kernels (manifest flat=1) ingest raw topk_ids /
 # topk_weights through the sorted_* kernarg slots and accumulate via
 # global_atomic_pk_add_bf16, so moe_sorting is a pass-through for them.
@@ -94,11 +84,6 @@ def _moe_prepare_unsorted_input(topk_ids, topk_weights, model_dim, moebuf_dtype)
     # sorted_expert_ids / num_valid_ids slots are unread by FLAT kernels,
     # but must be valid device pointers -- alias topk_ids as scratch.
     return topk_ids_i32, topk_weights_f32, topk_ids_i32, topk_ids_i32, moe_buf
-
-
-def _moe_prepare_mxfp4_passthrough(topk_ids, topk_weights):
-    # mxfp4_moe_run reads only topk_ids/weights; alias topk_ids into unused slots.
-    return topk_ids, topk_weights, topk_ids, topk_ids, topk_ids
 
 
 @functools.lru_cache(maxsize=1)
@@ -690,34 +675,6 @@ def fused_moe_(
         not metadata.flat or get_gfx() == "gfx950"
     ), f"FLAT fmoe asm kernels are gfx950-only; refusing to launch on {get_gfx()}. "
 
-    if metadata.mxfp4_hip:
-        # a4w4 gemm1/gemm2 run exclusively on the flydsl port.
-        _log_mxfp4_backend_once("flydsl (stage backend)")
-
-    if metadata.pipeline is not None:
-        return metadata.pipeline(
-            hidden_states,
-            w1,
-            w2,
-            topk_ids,
-            topk_weight,
-            topk,
-            block_size_M=block_size_M,
-            q_dtype_a=q_dtype_a,
-            q_dtype_w=q_dtype_w,
-            w1_scale=w1_scale,
-            w2_scale=w2_scale,
-            a1_scale=a1_scale,
-            a2_scale=a2_scale,
-            num_local_tokens=num_local_tokens,
-            M=M,
-            device=topk_ids.device,
-            doweight_stage1=doweight_stage1,
-            activation=activation,
-            quant_type=quant_type,
-            expert_mask=expert_mask,
-        )
-
     sort_aux = None
     if metadata.fused_sort:
         _kn2 = metadata.stage2.keywords.get("kernelName2", "")
@@ -738,13 +695,6 @@ def fused_moe_(
             block_size_M,
             accumulate=_atomic,
             fused_sort=True,
-        )
-        local_topk_ids = None
-    elif metadata.mxfp4_hip:
-        # mxfp4 HIP 1stage routes on-device; skip host sort, shuttle raw topk.
-        sorting_ret = _moe_prepare_mxfp4_passthrough(topk_ids, topk_weight)
-        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = (
-            sorting_ret
         )
         local_topk_ids = None
     else:
@@ -1110,13 +1060,11 @@ class MOEMetadata:
     fuse_quant: str = ""
     stage2_has_bias: bool = False
     flat: bool = False
-    mxfp4_hip: bool = False
     # Feature flags:
     #  - fused_sort: the sort emits the gemm/scatter extras (m_indices/reverse_sorted).
     #  - prequant: fused_moe_2stages quantizes a1 before stage1.
     fused_sort: bool = False
     prequant: bool = True
-    pipeline: Optional[Callable] = None
 
 
 def _needs_swiglu_bias_support(dtype, quant_type):
@@ -1276,35 +1224,6 @@ def _flydsl_stage2_wrapper(
         expert_mask=expert_mask,
         topk_ids=topk_ids,
     )
-
-
-# mxfp4 a4w4 gemm1/gemm2 kernel names encode the shape + tile + variant
-# (NE / D_HIDDEN / D_INTER / BM / variant) and route to the FlyDSL port.
-# The "E{n}" tag inside the name encodes D_INTER (per-shard inter_dim) --
-# the single-letter "E" is kept for brevity and does NOT mean expert count.
-# (NE, model_dim/H, inter_dim/E, topk) shapes whose full BM128 non-inline aux
-# (threestage sort + quant + sort_scales + scatter) is codegen'd in
-# gen_instances.py (SHAPES + AUX_EXTRA_SHAPES). These get the M-adaptive BM128
-# prefill path; any other mxfp4_moe shape stays BM16 inline_quant. Keep in sync
-# with gen_instances.py.
-_MXFP4_BM128_SHAPES = frozenset(
-    {
-        (385, 7168, 512, 9),  # Kimi-K2.5
-        (257, 7168, 512, 9),  # DSR (dsv3_b)
-        (256, 3072, 1536, 8),  # MiniMax (INTER 1536)
-        (256, 3072, 768, 8),  # MiniMax (INTER 768)
-        (32, 7168, 2048, 8),  # dsv3_a (NE=32)
-        (257, 7168, 256, 9),  # dsv3_c (INTER 256)
-        (384, 7168, 512, 8),  # Kimi-K2 (kimik2_a)
-        (385, 7168, 256, 9),  # kimik2_b (INTER 256)
-        (512, 4096, 256, 10),  # Qwen3.5 397B
-        (48, 7168, 3072, 6),  # dsv4 EP8 (full INTER)
-        (384, 7168, 1536, 6),  # dsv4 TP2
-        (384, 7168, 768, 6),  # dsv4 TP4
-        (384, 7168, 512, 6),  # dsv4 TP6
-        (256, 4096, 256, 6),  # dsv4-lite (H=4096)
-    }
-)
 
 
 def _empty_bf16(device):
@@ -2031,11 +1950,10 @@ def get_2stage_cfgs(
         else:
             return 16 if token < 2048 else 32 if token < 16384 else 64
 
-    # mxfp4 a4w4 rows are logged as "1stage" but drive an on-device pipeline
-    # (sort+gemm1+gemm2+scatter), NOT fused_moe_1stage. Build it from the CSV
-    # kernelName HERE, before the run_1stage early-return below -- otherwise the
-    # run_1stage path returns pipeline=None and fused_moe silently discards the
-    # tuned kernelName the CSV selected.
+    # mxfp4 a4w4 rows are logged as "1stage" but drive the unified stage backend
+    # (fused_sort + gemm1 + gemm2), NOT fused_moe_1stage. Build the metadata from
+    # the CSV kernelName HERE, before the run_1stage early-return below -- otherwise
+    # the run_1stage path would discard the tuned kernelName the CSV selected.
     if _is_mxfp4_kname(kernelName1) or _is_mxfp4_kname(kernelName2):
         try:
             _bm = _parse_mxfp4_g1_kname(kernelName1)["BM"]
@@ -2050,7 +1968,6 @@ def get_2stage_cfgs(
             block_m=_bm,
             ksplit=int(ksplit),
             fuse_quant="fp4",
-            mxfp4_hip=True,
             fused_sort=True,
             prequant=False,
         )
