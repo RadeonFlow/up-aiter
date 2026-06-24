@@ -323,11 +323,20 @@ def compile_gemm2_a4w4_port(
     _slot_bytes = saq_slot_bytes(BM)
     # Number of LDS A-slots (s_Aq stages). The K_TILES_TOTAL==2 fast path preloads
     # all 2 tiles into 2 slots (double buffer). The streaming K_TILES_TOTAL>2 path
-    # uses 3 slots (triple buffer) so the per-iteration read-slot (tile kt) and
-    # write-slot (tile kt+kStages, streamed in) never alias -- the read tile maps to
-    # kt%3 and the streamed tile to (kt+2)%3, which differ for all kt. (gemm1 uses
-    # the same kAStages=3 triple-buffer for its streaming non-128 path.)
-    _aStages = kStages if _K_TILES_TOTAL <= kStages else 3
+    # uses a quad buffer (4 slots): read-slot (tile kt) and write-slot (tile
+    # kt+kStages, streamed in) never alias, with two slots of slack between a
+    # slot's read and its next overwrite.
+    #
+    # A triple buffer (3 slots) is enough to avoid aliasing on paper, and works for
+    # most K_TILES_TOTAL, but K_TILES_TOTAL==8 (e.g. dsv3_a INTER=2048) miscompiled
+    # at BM16: the in-flight async raw.ptr.buffer.load.lds for a streamed slot was
+    # not reliably drained before that slot's ds_read 3 iterations later, producing
+    # non-deterministic garbage (e2e logits_diff ~0.02-0.05 vs the ~0.009 fp4
+    # floor; cosine ~0.90). The extra slot widens the read->overwrite window enough
+    # to hide the load latency and makes all K_TILES_TOTAL deterministic. LDS cost
+    # is free: the s_Aq slots (_aStages * BM*KH_TILE) stay <= the lds_acc cshuffle
+    # union (BM*BN*4) it overlaps, so the per-WG LDS footprint is unchanged.
+    _aStages = kStages if _K_TILES_TOTAL <= kStages else 4
     # atomic / mxfp4 epilog reuses LDS for the cshuffle (BM*BN f32); nonatomic
     # bf16 writes direct, so only s_Aq (_aStages slots) is needed. nonatomic_cshuffle
     # cshuffles in 64-row passes -> only min(BM,64)*BN f32 (BM128 -> 64KB not 128KB).
@@ -761,12 +770,25 @@ def _gemm2_body(
     #    only; the K_TILES_TOTAL==2 prologue is preloaded by the kernel). Mirrors
     #    gemm1.issue_a_load_lds: m_row-derived cached rows + lds_swizzle. -------
     def issue_a_load_lds(slot, kt):
-        for sub in range_constexpr(_kSubBlocks):
-            lds_row = wave * fx.Int32(_rows_per_wave) + fx.Int32(sub * 8)
-            car = m_row + lds_row + (lane // fx.Int32(8))
-            _issue_a_load_lds(
-                aq_rsrc, saq, slot, kt, car, lane, _slot_bytes, lds_row, k_half=_K_HALF
-            )
+        # Only the first n_load_waves hold A rows (BM16: waves 0,1; rows_per_wave=8
+        # -> 2 waves cover the 16-row block). Ungated, waves 2,3 would stream into
+        # lds_row 16/24 (past the BM16 slot) from car = m_row+16/24 (the next
+        # m-block's rows / wrong expert), corrupting the tile -- the prologue
+        # _issue_all_a_loads gates the same way (see wave < _n_load_waves below).
+        def _do():
+            for sub in range_constexpr(_kSubBlocks):
+                lds_row = wave * fx.Int32(_rows_per_wave) + fx.Int32(sub * 8)
+                car = m_row + lds_row + (lane // fx.Int32(8))
+                _issue_a_load_lds(
+                    aq_rsrc, saq, slot, kt, car, lane, _slot_bytes, lds_row,
+                    k_half=_K_HALF,
+                )
+
+        if const_expr(_n_load_waves < 4):
+            if wave < fx.Int32(_n_load_waves):
+                _do()
+        else:
+            _do()
 
     # -- ds_read(slot) -> a[i][k] (i32x4) ; i in [0,kMChunks) -----------------
     def issue_a_ds_read(slot):
@@ -874,10 +896,9 @@ def _gemm2_body(
 
         # main loop: OFFSET in [0, kUnroll). Process tile kt=OFFSET (read from LDS
         # slot kt%_aStages), and stream the next tile next_kt=kStages+OFFSET into
-        # slot next_kt%_aStages. With _aStages=3 (triple buffer) read-slot and
-        # write-slot never alias, so the streamed load cannot clobber the tile this
-        # iteration is reading. A loop-top barrier (inside _kloop_fence) guards the
-        # cross-iteration reuse of each slot.
+        # slot next_kt%_aStages. The quad buffer (_aStages=4) keeps read-slot and
+        # write-slot distinct with slack (see the _aStages note above). A loop-top
+        # barrier (inside _kloop_fence) guards the cross-iteration reuse of a slot.
         for OFFSET in range_constexpr(_kUnroll):
             kt = OFFSET
             slot = kt % _aStages
