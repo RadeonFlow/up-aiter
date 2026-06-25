@@ -71,6 +71,29 @@ def _silu_mul_batch(gs, us):
     return [gs[i] * sig[i] * us[i] for i in range(len(gs))]
 
 
+def _fabs_f32(x):
+    """fabsf via bit-mask (FlyDSL has no arith.absf): clear the sign bit."""
+    bits = _raw(x).bitcast(T.i32)
+    abs_bits = bits & _raw(fx.Int32(0x7FFFFFFF))
+    return fx.Float32(abs_bits.bitcast(T.f32))
+
+
+def _e8m0_roundup(amax_f32):
+    """RoundUp e8m0 = ceil_pow2(amax / 6), clamped to 254."""
+    wi = fx.Int32(_raw(amax_f32 * fx.Float32(1.0 / 6.0)).bitcast(T.i32))
+    bexp = (wi + fx.Int32(0x7FFFFF)).shrui(fx.Int32(23)) & fx.Int32(0xFF)
+    lt = arith.cmpi(arith.CmpIPredicate.ult, _raw(bexp), _raw(fx.Int32(254)))
+    return fx.Int32(arith.select(lt, _raw(bexp), _raw(fx.Int32(254))))
+
+
+def _e8m0_from_amax(amax_f32):
+    """Returns (e8m0_i32, quant_scale_f32)."""
+    e8m0 = _e8m0_roundup(amax_f32)
+    qscale = fx.Float32(_raw(e8m0 << fx.Int32(23)).bitcast(T.f32))
+    return e8m0, qscale
+
+
+# -- inline-quant helpers (HIP mxfp4_gemm_common.hpp:76-94) -------------------
 def _pkmax_u16(a_i32, b_i32):
     _v2i16 = ir.Type.parse("vector<2xi16>")
     va = llvm.BitcastOp(_v2i16, _raw(a_i32)).result
@@ -81,6 +104,7 @@ def _pkmax_u16(a_i32, b_i32):
 
 
 def _inline_e8m0(amax_u16_i32):
+    """RoundUp e8m0 from a packed u16 (bf16) amax. Returns e8m0 as i32 (0..254)."""
     f32 = fx.Float32(
         _raw((fx.Int32(_raw(amax_u16_i32)) & fx.Int32(0xFFFF)) << fx.Int32(16)).bitcast(
             T.f32
@@ -165,9 +189,21 @@ def _gemm1_body(
     ascale_num = arith.index_cast(T.index, _raw(i32_total_m_blocks)) * fx.Index(
         _asc_per_mb
     )
-    ascale_rsrc = _buffer_rsrc(arg_ascale, ascale_num)
-    bq_rsrc = _buffer_rsrc(arg_bq, BQ_BYTES)
-    bscale_rsrc = _buffer_rsrc(arg_bscale, BSCALE_BYTES)
+    _asc_per_mb = max(BM // 32, 1) * kAS_per_chunk_dw * 4
+    ascale_num = arith.index_cast(T.index, _raw(i32_total_m_blocks)) * fx.Index(
+        _asc_per_mb
+    )
+    ascale_rsrc = buffer_ops.create_buffer_resource_from_addr(
+        _raw(fx.Int64(arg_ascale)), num_records_bytes=ascale_num
+    )
+    bq_rsrc = buffer_ops.create_buffer_resource_from_addr(
+        _raw(fx.Int64(arg_bq)), num_records_bytes=BQ_BYTES
+    )
+    bscale_rsrc = buffer_ops.create_buffer_resource_from_addr(
+        _raw(fx.Int64(arg_bscale)), num_records_bytes=BSCALE_BYTES
+    )
+    # hidden_states rsrc (inline-quant only): n_tokens*K*sizeof(bf16) bytes (HIP :92-97).
+    # Non-inline keeps arg_hidden unused.
     hidden_rsrc = None
     if const_expr(inline_quant):
         hidden_num = arith.index_cast(T.index, _raw(i32_ntok * fx.Int32(K * 2)))
