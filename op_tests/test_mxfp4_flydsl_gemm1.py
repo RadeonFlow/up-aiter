@@ -437,6 +437,7 @@ def test_flydsl_gemm1_parametrized_shape_numeric(NE, H, INTER, TOPK, interleave)
     # shapes use the torch replica (validated vs HIP at the KIMI shape: identical
     # sti/sei/cumsum/m_indices). Both produce the exact layout gemm1 consumes.
     if (NE, topk) == (385, 9):
+
         def eb():
             return torch.empty((0,), device=device, dtype=dtypes.bf16)
 
