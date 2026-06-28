@@ -301,7 +301,10 @@ def gemm_a16w16(
         # Caller-provided (pre-zeroed) C buffer for the split-K atomic-add path.
         # Only the FlyDSL hgemm launcher honors it (see flydsl_gemm); other
         # backends ignore it and allocate their own — handled below.
-        config = {**config, "out": caller_out.view(-1, caller_out.size(-1)) if batched else caller_out}
+        config = {
+            **config,
+            "out": caller_out.view(-1, caller_out.size(-1)) if batched else caller_out,
+        }
     out = solfunc(
         inp_view,
         B,
