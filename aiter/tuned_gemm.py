@@ -240,6 +240,7 @@ def gen_gemm_a16w16_fake_tensor(
     scale_a: Optional[Tensor] = None,
     scale_b: Optional[Tensor] = None,
     scale_c: Optional[Tensor] = None,
+    prezero: bool = False,
 ) -> Tensor:
     return torch.empty(
         *A.shape[:-1],
@@ -258,6 +259,7 @@ def gemm_a16w16(
     scale_a: Optional[Tensor] = None,
     scale_b: Optional[Tensor] = None,
     scale_c: Optional[Tensor] = None,
+    prezero: bool = False,
 ) -> Tensor:
     bpreshuffle = False
     if hasattr(B, "is_shuffled") and B.is_shuffled is True:
@@ -288,6 +290,8 @@ def gemm_a16w16(
     libtype = config["libtype"]
     solution_idx = config["solidx"]
     solfunc = solMap[libtype]
+    if prezero:
+        config = {**config, "prezero": True}
     out = solfunc(
         inp_view,
         B,
@@ -481,6 +485,7 @@ def flydsl_gemm(
         b_to_lds=flydsl_config["b_to_lds"],
         b_preshuffle=flydsl_config.get("b_preshuffle", False),
         c_to_lds=flydsl_config.get("c_to_lds", False),
+        prezero=config.get("prezero", False),
     )
 
     if bias is not None and fused_bias is None:
@@ -604,6 +609,7 @@ class TunedGemm:
         scale_a: Optional[Tensor] = None,
         scale_b: Optional[Tensor] = None,
         scale_c: Optional[Tensor] = None,
+        prezero: bool = False,
     ):
 
         out = gemm_a16w16(
@@ -614,6 +620,7 @@ class TunedGemm:
             scale_a=scale_a,
             scale_b=scale_b,
             scale_c=scale_c,
+            prezero=prezero,
         )
         return out
 
