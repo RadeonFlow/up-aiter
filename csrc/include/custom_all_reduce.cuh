@@ -1947,7 +1947,6 @@ __global__ void __launch_bounds__(1024, 1)
     using P                 = typename opus::vector_t<T, pack_size>;
     using OP                = typename opus::vector_t<OutT, pack_size>;
     using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
-    int token_num           = size / hidden_dim;
     int access_id_in_token  = threadIdx.x * pack_size;
     const P* ptrs[ngpus];
     P* tmps[ngpus];

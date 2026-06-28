@@ -84,7 +84,7 @@ def compile_flydsl_hgemm_kernel(
     if kernel_family == KERNEL_FAMILY_HGEMM_4WAVE:
         # BN<-tile_n, BM<-tile_m, BK<-tile_k, SPLITK<-split_k.
         return compile_splitk_hgemm_4wave(
-            n, k, tile_n, split_k, tile_m, BK=tile_k, dtype=dtype
+            n, k, tile_n, split_k, tile_m, BK=tile_k, dtype=dtype, PREZERO=prezero
         )
 
     raise ValueError(

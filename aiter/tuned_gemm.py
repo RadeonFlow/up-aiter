@@ -249,7 +249,10 @@ def gen_gemm_a16w16_fake_tensor(
     scale_b: Optional[Tensor] = None,
     scale_c: Optional[Tensor] = None,
     prezero: bool = False,
+    out: Optional[Tensor] = None,
 ) -> Tensor:
+    if out is not None:
+        return out
     return torch.empty(
         *A.shape[:-1],
         B.shape[0],
@@ -268,6 +271,7 @@ def gemm_a16w16(
     scale_b: Optional[Tensor] = None,
     scale_c: Optional[Tensor] = None,
     prezero: bool = False,
+    out: Optional[Tensor] = None,
 ) -> Tensor:
     bpreshuffle = False
     if hasattr(B, "is_shuffled") and B.is_shuffled is True:
@@ -300,6 +304,12 @@ def gemm_a16w16(
     solfunc = solMap[libtype]
     if prezero:
         config = {**config, "prezero": True}
+    caller_out = out
+    if caller_out is not None:
+        # Caller-provided (pre-zeroed) C buffer for the split-K atomic-add path.
+        # Only the FlyDSL hgemm launcher honors it (see flydsl_gemm); other
+        # backends ignore it and allocate their own — handled below.
+        config = {**config, "out": caller_out.view(-1, caller_out.size(-1)) if batched else caller_out}
     out = solfunc(
         inp_view,
         B,
@@ -316,6 +326,11 @@ def gemm_a16w16(
         out = out.view(*A.shape[:-1], B.shape[0])
     if otype is not None and out.dtype != otype:
         out = out.to(otype)
+    if caller_out is not None and out.data_ptr() != caller_out.data_ptr():
+        # Backend ignored the caller buffer (non-FlyDSL path); land the result in
+        # it so prezero/out callers always observe the correct output.
+        caller_out.copy_(out)
+        out = caller_out
     save_shapes(
         m,
         n,
@@ -475,6 +490,7 @@ def flydsl_gemm(
     out = aiter.ops.flydsl.gemm_kernels.flydsl_hgemm(
         inp,
         weights,
+        out=config.get("out"),
         bias=fused_bias,
         kernel_family=flydsl_config.get("kernel_family"),
         tile_m=flydsl_config["tile_m"],
@@ -618,6 +634,7 @@ class TunedGemm:
         scale_b: Optional[Tensor] = None,
         scale_c: Optional[Tensor] = None,
         prezero: bool = False,
+        out: Optional[Tensor] = None,
     ):
 
         out = gemm_a16w16(
@@ -629,6 +646,7 @@ class TunedGemm:
             scale_b=scale_b,
             scale_c=scale_c,
             prezero=prezero,
+            out=out,
         )
         return out
 
