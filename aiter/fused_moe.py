@@ -1230,7 +1230,6 @@ def _mxfp4_a4w4_stage1(
             NE=NE,
             TOPK=topk,
             D_HIDDEN=D_HIDDEN,
-            D_INTER=D_INTER,
             MB=BM,
             max_sorted=max_sorted,
         )
