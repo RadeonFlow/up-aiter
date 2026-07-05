@@ -167,9 +167,6 @@ def compile_gemm2_a4w4_port(
         _aq_num = arith.index_cast(T.index, _raw(i32_max_m_blocks)) * fx.Index(
             BM * _K_HALF
         )
-        aq_rsrc = buffer_ops.create_buffer_resource_from_addr(
-            _raw(fx.Int64(arg_aq)), num_records_bytes=_aq_num
-        )
         aq_rsrc = _buffer_rsrc(arg_aq, _aq_num)
         saq = SmemPtr(
             allocator.get_base(), lds_off, T.i8, shape=(_aStages * _slot_bytes,)
@@ -396,18 +393,10 @@ def _gemm2_body(
     e = rocdl.readfirstlane(T.i32, e)
     m_row = m_block_idx * fx.Int32(BM)
 
-    # -- buffer resources (exact num_bytes) ----------------------------------
-    # (A_q resource + A->LDS loads are issued by the kernel before the branch.)
     _asc_num = arith.index_cast(T.index, _raw(i32_max_m_blocks)) * fx.Index(_asc_per_mb)
-    ascale_rsrc = buffer_ops.create_buffer_resource_from_addr(
-        _raw(fx.Int64(arg_ascale)), num_records_bytes=_asc_num
-    )
-    bq_rsrc = buffer_ops.create_buffer_resource_from_addr(
-        _raw(fx.Int64(arg_bq)), num_records_bytes=fx.Index(_bq_bytes)
-    )
-    bscale_rsrc = buffer_ops.create_buffer_resource_from_addr(
-        _raw(fx.Int64(arg_bscale)), num_records_bytes=fx.Index(_bscale_bytes)
-    )
+    ascale_rsrc = _buffer_rsrc(arg_ascale, _asc_num)
+    bq_rsrc = _buffer_rsrc(arg_bq, fx.Index(_bq_bytes))
+    bscale_rsrc = _buffer_rsrc(arg_bscale, fx.Index(_bscale_bytes))
 
     lds_base = allocator.get_base()
     saq = SmemPtr(lds_base, lds_off, T.i8, shape=(_aStages * _slot_bytes,))
@@ -782,28 +771,11 @@ def _flat_mxfp4_epilog(
                 abs_e = _raw(_fabs_f32(r[e]))
                 amax_f = arith.maxnumf(amax_f, abs_e)
             amax = arith.shrui(arith.bitcast(T.i32, amax_f), _raw(fx.Int32(16)))
-            # DPP quad-amax (reduce across the 4 kk-lanes of the block)
-            s1 = rocdl.update_dpp(T.i32, amax, amax, 0xB1, 0xF, 0xF, True)
-            a = arith.maxui(amax, s1)
-            s2 = rocdl.update_dpp(T.i32, a, a, 0x4E, 0xF, 0xF, True)
-            amax_dpp = arith.maxui(a, s2)
-            # encode e8m0 RoundUp: e8 = ceil_pow2(amax/6)
+            amax_dpp = _raw(_inline_dpp_quad_amax(amax))
             f32b = arith.shli(amax_dpp, _raw(fx.Int32(16)))
-            working_i = arith.bitcast(
-                T.i32,
-                arith.mulf(arith.bitcast(T.f32, f32b), _raw(fx.Float32(1.0 / 6.0))),
-            )
-            bexp = arith.andi(
-                arith.shrui(
-                    arith.addi(working_i, _raw(fx.Int32(0x7FFFFF))), _raw(fx.Int32(23))
-                ),
-                _raw(fx.Int32(0xFF)),
-            )
-            e8 = arith.minsi(
-                _raw(fx.Int32(254)),
-                arith.maxsi(_raw(fx.Int32(0)), bexp),
-            )
-            qscale = arith.bitcast(T.f32, arith.shli(e8, _raw(fx.Int32(23))))
+            e8m0, qscale_f = _e8m0_from_amax(fx.Float32(arith.bitcast(T.f32, f32b)))
+            e8 = _raw(e8m0)
+            qscale = _raw(qscale_f)
             packed = _raw(fx.Int32(0))
             packed = rocdl.cvt_scalef32_pk_fp4_f32(
                 T.i32, packed, _raw(r[0]), _raw(r[1]), qscale, 0

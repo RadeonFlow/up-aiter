@@ -41,6 +41,8 @@ def _get_compiled_mxfp4_gemm1_port(
         D_INTER=D_INTER,
         NE=NE,
         TOPK=topk,
+        BN=BN,
+        BK=BK,
         interleave=interleave,
         xcd_swizzle=xcd_swizzle,
     )

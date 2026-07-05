@@ -2,9 +2,8 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 # =============================================================================
-# splitk_hgemm_fixed_tile (flydsl) — a fixed-tile (4-wave / 256-thread) split-K bf16
-#   GEMM, faithful FlyDSL port of the hand-written HIP cuh
-#   csrc/kernels/prezero_gemm/splitk_gemm_a16w16.cuh.
+# splitk_hgemm_fixed_tile (flydsl) — a fixed-4-wave split-K bf16 GEMM, faithful FlyDSL
+#   port of the hand-written HIP cuh csrc/kernels/prezero_gemm/splitk_gemm_a16w16.cuh.
 #
 #   C[M,N] += A[M,K] @ B[N,K]^T   (TN, bf16 in / fp32 accumulate / packed-bf16 atomic out).
 #   C is zeroed in-kernel (when ZERO_INIT): ksplit==0 zeros its tile + a per-tile
@@ -148,7 +147,9 @@ def compile_splitk_hgemm_fixed_tile(
     smem_b_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = smem_b_offset + BS_BYTES
 
-    KERNEL_NAME = f"splitk_hgemm_4wave_{dtype}_M{BM}xN{BN}xK{BK}_SPK{SPLITK}_{GPU_ARCH}"
+    KERNEL_NAME = (
+        f"splitk_hgemm_fixed_tile_{dtype}_M{BM}xN{BN}xK{BK}_SPK{SPLITK}_{GPU_ARCH}"
+    )
     if not ZERO_INIT:
         KERNEL_NAME += "_NOZINIT"
 
@@ -492,7 +493,7 @@ def compile_splitk_hgemm_fixed_tile(
 _SIG_SEM_CACHE = {}
 
 
-def _get_fixed_tile_sig_sem(device):
+def _get_4wave_sig_sem(device):
     """Persistent per-device signal/semaphore buffers, reset in-kernel."""
     import torch
 
@@ -515,7 +516,7 @@ def splitk_hgemm_fixed_tile(C, A, B, BN, SPLITK, BM, BK=128, stream=None):
 
     N, K, m = B.shape[0], A.shape[1], int(A.shape[0])
     launch = compile_splitk_hgemm_fixed_tile(N, K, BN, SPLITK, BM, BK=BK, dtype="bf16")
-    sema, sig = _get_fixed_tile_sig_sem(C.device)
+    sema, sig = _get_4wave_sig_sem(C.device)
     s = torch.cuda.current_stream() if stream is None else stream
 
     def _pv(t):

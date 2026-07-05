@@ -385,13 +385,7 @@ def test_fmoe(
     )
 
     # ######################## stage 2 end ###########
-    out2_ck, us2 = run_perftest(
-        fused_moe,
-        input,
-        w1_qt_aiter,
-        w2_qt_aiter,
-        topk_weights,
-        topk_ids,
+    _fused_moe_kwargs = dict(
         w1_scale=w1_scale_aiter,
         w2_scale=w2_scale_aiter,
         quant_type=qType,
@@ -811,6 +805,7 @@ def _iter_csv_cases():
         # In targeted --csv-filter validation runs, skip the AOT-cache gate (new
         # configs have no pre-registered AOT cache entry).
         kwargs["check_aot_cache"] = args.csv_filter is None
+        kwargs["disable_stage2_bias"] = kernel_name2.startswith("opus_")
         yield kwargs, {
             "kernelName1": kernel_name1,
             "kernelName2": kernel_name2,

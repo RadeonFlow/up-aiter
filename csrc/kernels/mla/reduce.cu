@@ -5,6 +5,10 @@
 #include "custom_all_reduce.cuh"
 #include "mla.h"
 #include "opus/opus.hpp"
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
+#include <sstream>
+#include <torch/python.h>
 #include <vector>
 
 template <int32_t kSizeDV_, int32_t kNumHeadQ_, int32_t kNumThreadGroupPerBh_>

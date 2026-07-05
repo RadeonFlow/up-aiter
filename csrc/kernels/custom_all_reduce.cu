@@ -638,16 +638,16 @@ void fused_allreduce_rmsnorm_quant(fptr_t _fa,
         _fused_allreduce_rmsnorm(_fa,
                                  (void*)reg_ptr, res_inp.data_ptr(), res_out.data_ptr(),
                                  out.data_ptr(), scale_out.data_ptr(), w.data_ptr(),
-                                 dtype, (float)eps, m, input_n, n, n, use_1stage, false,
-                                 nullptr, 0);
+                                 dtype, (float)eps, m, input_n, n, n, use_1stage,
+                                 gemma_norm, nullptr, 0);
     }
     else
     {
         _fused_allreduce_rmsnorm(_fa,
                                  inp.data_ptr(), res_inp.data_ptr(), res_out.data_ptr(),
                                  out.data_ptr(), scale_out.data_ptr(), w.data_ptr(),
-                                 dtype, (float)eps, m, input_n, n, n, use_1stage, false,
-                                 nullptr, 0);
+                                 dtype, (float)eps, m, input_n, n, n, use_1stage,
+                                 gemma_norm, nullptr, 0);
     }
 }
 

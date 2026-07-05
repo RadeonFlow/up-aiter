@@ -31,8 +31,21 @@ from aiter.jit.utils.chip_info import (
     gfx_from_cu_num,
 )
 from aiter.jit.utils.torch_guard import torch_compile_guard
-from aiter.ops.flydsl.moe_common import GateMode
-from aiter.ops.flydsl.utils import is_flydsl_available
+
+try:
+    from aiter.ops.flydsl.utils import is_flydsl_available
+    from aiter.ops.flydsl.moe_common import GateMode
+except ImportError:
+
+    class GateMode(Enum):
+        SEPARATED = "separated"
+        INTERLEAVE = "interleave"
+
+    def is_flydsl_available():
+        return False
+
+
+from aiter.ops.opus import moe_stage2_a8w4_fused_adapter as _opus_a8w4
 from aiter.ops.flydsl.mxfp4_kname import (
     _is_mxfp4_kname,
     _parse_mxfp4_g1_kname,
@@ -44,6 +57,7 @@ BLOCK_SIZE_M = 32
 # Sorting backend flags (mutually exclusive; CK > FlyDSL > Opus priority).
 # Default is Opus.  Set AITER_USE_FLYDSL_MOE_SORTING=1 to prefer FlyDSL when available.
 _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
+_USE_FLYDSL_MOE_SORTING = os.environ.get("AITER_USE_FLYDSL_MOE_SORTING", "0") == "1"
 # "adaptive sort" backend selection (our mxfp4 sort as a general World-1 backend):
 #   auto (default) -> same as adaptive; NO shape fallback. The adaptive kernel is
 #                     codegen'd for a fixed shape set (see SHAPES in
@@ -58,6 +72,11 @@ _MOE_SORT_BACKEND = os.environ.get("AITER_MOE_SORT_BACKEND", "auto").lower()
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
+
+# Opt-in kernel-bench hook: a caller sets a list here to collect (name, callable)
+# per-kernel launches in fused_moe_2stages ("stage1"/"stage2"); None in production
+# so there is no overhead.
+kernel_bench_callable = None
 
 # FLAT 1stage asm kernels (manifest flat=1) ingest raw topk_ids /
 # topk_weights through the sorted_* kernarg slots and accumulate via
@@ -331,6 +350,25 @@ def moe_sorting(
     flat=False,
     output_aux=False,
 ):
+    if (
+        not _USE_CK_MOE_SORTING
+        and _USE_FLYDSL_MOE_SORTING
+        and is_flydsl_available()
+        and not return_local_topk_ids
+        and not flat
+        and dispatch_policy == 0
+    ):
+        return _flydsl_moe_sorting(
+            topk_ids,
+            topk_weights,
+            num_experts,
+            model_dim,
+            moebuf_dtype,
+            block_size,
+            expert_mask,
+            num_local_tokens,
+            accumulate=accumulate,
+        )
     # FLAT kernel: in-kernel routing (manifest flat=1); pass through unsorted topk.
     if flat:
         return _moe_prepare_unsorted_input(
@@ -577,6 +615,52 @@ def fused_moe_(
         else:
             q_dtype_a = dtypes.fp4x2
 
+    if get_gfx() == "gfx1250":
+        if os.environ.get("AITER_FORCE_A8W4", "0") in ("1"):
+            q_dtype_a = dtypes.fp8
+        else:
+            q_dtype_a = dtypes.fp4x2
+
+    grouped_a8w4_out = None
+    if is_flydsl_available():
+        try:
+            from aiter.ops.flydsl.grouped_moe_gfx1250 import (
+                _maybe_grouped_gfx1250_a8w4_moe,
+            )
+        except ImportError:
+            _maybe_grouped_gfx1250_a8w4_moe = None
+
+        if _maybe_grouped_gfx1250_a8w4_moe is not None:
+            grouped_a8w4_out = _maybe_grouped_gfx1250_a8w4_moe(
+                hidden_states,
+                w1,
+                w2,
+                topk_weight,
+                topk_ids,
+                E=E,
+                model_dim=model_dim,
+                inter_dim=inter_dim,
+                dtype=dtype,
+                activation=activation,
+                quant_type=quant_type,
+                q_dtype_a=q_dtype_a,
+                q_dtype_w=q_dtype_w,
+                isG1U1=isG1U1,
+                doweight_stage1=doweight_stage1,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                expert_mask=expert_mask,
+                hidden_pad=hidden_pad,
+                intermediate_pad=intermediate_pad,
+                bias1=bias1,
+                bias2=bias2,
+                gate_mode=gate_mode,
+                swiglu_limit=swiglu_limit,
+            )
+
+    if grouped_a8w4_out is not None:
+        return grouped_a8w4_out
+
     metadata = get_2stage_cfgs(
         get_padded_M(M),  # consider token_num > 1024 as prefill
         model_dim,
@@ -595,6 +679,7 @@ def fused_moe_(
         isShuffled,
         gate_mode,
         is_ep=expert_mask is not None,
+        has_stage2_bias=bias2 is not None,
     )
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
@@ -660,7 +745,7 @@ def fused_moe_(
             num_local_tokens,
             moe_sorting_dispatch_policy,
             return_local_topk_ids=need_local_topk_ids,
-            accumulate=not is_flydsl_stage2_reduce(metadata.stage2),
+            accumulate=not stage2_uses_route_reduce(metadata.stage2),
             flat=metadata.flat,
         )
         if need_local_topk_ids:
@@ -677,6 +762,7 @@ def fused_moe_(
                 sorting_ret
             )
             local_topk_ids = None
+    _opus_a8w4.check_route_bucket_metadata(metadata, sorted_expert_ids, logger)
 
     if metadata.run_1stage:
         _stage1_call = functools.partial(
@@ -1021,6 +1107,11 @@ class MOEMetadata:
     #  - prequant: fused_moe_2stages quantizes a1 before stage1.
     output_aux: bool = False
     prequant: bool = True
+    skip_inter_quant: bool = False
+    route_bucket: str = ""
+    expected_sorted_blocks: Optional[int] = None
+    min_sorted_blocks: Optional[int] = None
+    max_sorted_blocks: Optional[int] = None
 
 
 def _needs_swiglu_bias_support(dtype, quant_type):
@@ -1587,6 +1678,7 @@ def get_2stage_cfgs(
     is_shuffled=True,
     gate_mode=GateMode.SEPARATED.value,
     is_ep=False,
+    has_stage2_bias=False,
 ):
     gate_mode = GateMode(gate_mode)
     # Configs are keyed on (gfx, cu_num, ...) so archs that share a cu_num
@@ -1968,6 +2060,7 @@ def get_2stage_cfgs(
     is_flydsl1 = isinstance(kernelName1, str) and kernelName1.startswith("flydsl_")
     is_flydsl2 = isinstance(kernelName2, str) and kernelName2.startswith("flydsl_")
     is_cktile2 = isinstance(kernelName2, str) and kernelName2.startswith("cktile_")
+    is_opus2 = _opus_a8w4.is_opus_a8w4_stage2_kernel(kernelName2)
     if (is_flydsl1 or is_flydsl2) and is_flydsl_available():
         enable_bias = (
             _needs_swiglu_bias_support(dtype, q_type) and q_dtype_w == dtypes.fp4x2
@@ -2560,7 +2653,8 @@ def fused_moe_2stages(
         extra_stage1_args["m_indices"] = m_indices
         extra_stage1_args["moe_buf"] = _sort_moe_buf
         extra_stage2_args["reverse_sorted"] = reverse_sorted
-    a2 = metadata.stage1(
+    _stage1_call = functools.partial(
+        metadata.stage1,
         a1,
         w1,
         w2,
@@ -2587,6 +2681,9 @@ def fused_moe_2stages(
         sorted_weights=sorted_weights if doweight_stage1 else None,
         **extra_stage1_args,
     )
+    if kernel_bench_callable is not None:
+        kernel_bench_callable.append(("stage1", _stage1_call))
+    a2 = _stage1_call()
     if m_indices is not None and isinstance(a2, tuple):
         a2, a2_scale = a2[0], a2[1]
     elif metadata.fuse_quant == "fp4" and isinstance(a2, tuple):
