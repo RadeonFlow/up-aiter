@@ -47,6 +47,7 @@ def reduce_scatter(
     split_dim: int,
     reg_ptr: int,
     reg_bytes: int,
+    end_sync: bool = True,
 ) -> None: ...
 
 
@@ -56,6 +57,7 @@ def all_gather_reg(
     inp: torch.Tensor,
     out: torch.Tensor,
     dim: int,
+    end_sync: bool = True,
 ) -> None: ...
 
 
@@ -67,6 +69,7 @@ def all_gather_unreg(
     out: torch.Tensor,
     reg_bytes: int,
     dim: int,
+    end_sync: bool = True,
 ) -> None: ...
 
 
@@ -84,6 +87,7 @@ def fused_allreduce_rmsnorm(
     use_1stage: bool,
     gemma_norm: bool = False,
     zero_fill: Optional[torch.Tensor] = None,
+    end_sync: bool = True,
 ) -> None: ...
 
 
@@ -101,6 +105,7 @@ def fused_allreduce_rmsnorm_pad(
     use_1stage: bool,
     gemma_norm: bool = False,
     zero_fill: Optional[torch.Tensor] = None,
+    end_sync: bool = True,
 ) -> None: ...
 
 
@@ -129,6 +134,7 @@ def fused_allreduce_rmsnorm_quant(
     reg_bytes: int,
     use_1stage: bool,
     gemma_norm: bool = False,
+    end_sync: bool = True,
 ) -> None: ...
 
 
@@ -148,6 +154,7 @@ def fused_allreduce_rmsnorm_quant_per_group(
     use_1stage: bool,
     bf16_out_ptr: int = 0,
     transpose_scale: bool = False,
+    end_sync: bool = True,
 ) -> None: ...
 
 
@@ -165,6 +172,7 @@ def fused_allreduce_rmsnorm_mxfp4_quant(
     reg_bytes: int,
     use_1stage: bool,
     bf16_out_ptr: int = 0,
+    end_sync: bool = True,
 ) -> None: ...
 
 

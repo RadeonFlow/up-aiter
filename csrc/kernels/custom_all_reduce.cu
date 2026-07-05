@@ -121,7 +121,8 @@ static void _all_reduce(fptr_t _fa, void* inp, void* out,
 static void _reduce_scatter(fptr_t _fa, void* inp, void* out,
                             int m, int n, int k,
                             aiter::ReduceScatterSplitDim split_dim,
-                            AiterDtype dtype)
+                            AiterDtype dtype,
+                            bool end_sync)
 {
     hipStream_t stream = aiter::getCurrentHIPStream();
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
@@ -131,14 +132,14 @@ static void _reduce_scatter(fptr_t _fa, void* inp, void* out,
         fa->dispatchReduceScatter<opus::fp32_t>(stream,
                                      reinterpret_cast<opus::fp32_t*>(inp),
                                      reinterpret_cast<opus::fp32_t*>(out),
-                                     m, n, k, split_dim);
+                                     m, n, k, split_dim, end_sync);
         break;
     }
     case AITER_DTYPE_fp16: {
         fa->dispatchReduceScatter<opus::fp16_t>(stream,
                                     reinterpret_cast<opus::fp16_t*>(inp),
                                     reinterpret_cast<opus::fp16_t*>(out),
-                                    m, n, k, split_dim);
+                                    m, n, k, split_dim, end_sync);
         break;
     }
 #if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
@@ -146,7 +147,7 @@ static void _reduce_scatter(fptr_t _fa, void* inp, void* out,
         fa->dispatchReduceScatter<opus::bf16_t>(stream,
                                               reinterpret_cast<opus::bf16_t*>(inp),
                                               reinterpret_cast<opus::bf16_t*>(out),
-                                              m, n, k, split_dim);
+                                              m, n, k, split_dim, end_sync);
         break;
     }
 #endif
@@ -157,7 +158,8 @@ static void _reduce_scatter(fptr_t _fa, void* inp, void* out,
 
 static void _all_gather(fptr_t _fa, void* inp, void* out,
                         int64_t size, AiterDtype dtype,
-                        int64_t last_dim_size, int64_t gather_dim)
+                        int64_t last_dim_size, int64_t gather_dim,
+                        bool end_sync)
 {
     hipStream_t stream = aiter::getCurrentHIPStream();
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
@@ -167,14 +169,14 @@ static void _all_gather(fptr_t _fa, void* inp, void* out,
         fa->dispatchAllGather<opus::fp32_t>(stream,
                                      reinterpret_cast<opus::fp32_t*>(inp),
                                      reinterpret_cast<opus::fp32_t*>(out),
-                                     size, last_dim_size, gather_dim);
+                                     size, last_dim_size, gather_dim, end_sync);
         break;
     }
     case AITER_DTYPE_fp16: {
         fa->dispatchAllGather<opus::fp16_t>(stream,
                                     reinterpret_cast<opus::fp16_t*>(inp),
                                     reinterpret_cast<opus::fp16_t*>(out),
-                                    size, last_dim_size, gather_dim);
+                                    size, last_dim_size, gather_dim, end_sync);
         break;
     }
 #if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
@@ -182,7 +184,7 @@ static void _all_gather(fptr_t _fa, void* inp, void* out,
         fa->dispatchAllGather<opus::bf16_t>(stream,
                                     reinterpret_cast<opus::bf16_t*>(inp),
                                     reinterpret_cast<opus::bf16_t*>(out),
-                                    size, last_dim_size, gather_dim);
+                                    size, last_dim_size, gather_dim, end_sync);
         break;
     }
 #endif
@@ -200,7 +202,8 @@ static void _fused_allreduce_rmsnorm(fptr_t _fa,
                                      bool use_1stage,
                                      bool gemma_norm,
                                      void* zero_fill,
-                                     int zero_fill_elems)
+                                     int zero_fill_elems,
+                                     bool end_sync)
 {
     hipStream_t stream = aiter::getCurrentHIPStream();
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
@@ -224,7 +227,8 @@ static void _fused_allreduce_rmsnorm(fptr_t _fa,
             use_1stage,                                          \
             gemma_norm,                                          \
             reinterpret_cast<DTYPE*>(zero_fill),                 \
-            zero_fill_elems);                                    \
+            zero_fill_elems,                                    \
+            end_sync);                                           \
     }                                                            \
     else                                                         \
     {                                                            \
@@ -245,7 +249,8 @@ static void _fused_allreduce_rmsnorm(fptr_t _fa,
             m,                                                   \
             n,                                                   \
             use_1stage,                                          \
-            gemma_norm);                                         \
+            gemma_norm,                                          \
+            end_sync);                                           \
     }
 
     switch(dtype)
@@ -448,7 +453,8 @@ void reduce_scatter(fptr_t _fa,
                     const aiter_tensor_t& out,
                     int64_t m, int64_t n, int64_t k,
                     int64_t split_dim,
-                    int64_t reg_ptr, int64_t reg_bytes)
+                    int64_t reg_ptr, int64_t reg_bytes,
+                    bool end_sync)
 {
     HipDeviceGuard device_guard(inp.device_id);
     hipStream_t stream = aiter::getCurrentHIPStream();
@@ -464,25 +470,26 @@ void reduce_scatter(fptr_t _fa,
                                 hipMemcpyDeviceToDevice, stream));
         _reduce_scatter(_fa, (void*)reg_ptr, out.data_ptr(),
                         static_cast<int>(m), static_cast<int>(n), static_cast<int>(k),
-                        sd, dtype);
+                        sd, dtype, end_sync);
     }
     else
     {
         _reduce_scatter(_fa, inp.data_ptr(), out.data_ptr(),
                         static_cast<int>(m), static_cast<int>(n), static_cast<int>(k),
-                        sd, dtype);
+                        sd, dtype, end_sync);
     }
 }
 
 void all_gather_reg(fptr_t _fa,
                     const aiter_tensor_t& inp,
                     const aiter_tensor_t& out,
-                    int64_t dim)
+                    int64_t dim,
+                    bool end_sync)
 {
     HipDeviceGuard device_guard(inp.device_id);
     int64_t last_dim_size = inp.size(-1);
     _all_gather(_fa, inp.data_ptr(), out.data_ptr(), inp.numel(), inp.dtype(),
-                last_dim_size, dim);
+                last_dim_size, dim, end_sync);
 }
 
 void all_gather_unreg(fptr_t _fa,
@@ -490,7 +497,8 @@ void all_gather_unreg(fptr_t _fa,
                       int64_t reg_buffer,
                       const aiter_tensor_t& out,
                       int64_t reg_bytes,
-                      int64_t dim)
+                      int64_t dim,
+                      bool end_sync)
 {
     HipDeviceGuard device_guard(inp.device_id);
     hipStream_t stream = aiter::getCurrentHIPStream();
@@ -502,7 +510,7 @@ void all_gather_unreg(fptr_t _fa,
     HIP_CALL(hipMemcpyAsync((void*)reg_buffer, inp.data_ptr(), data_bytes,
                             hipMemcpyDeviceToDevice, stream));
     _all_gather(_fa, (void*)reg_buffer, out.data_ptr(), inp.numel(), inp.dtype(),
-                last_dim_size, dim);
+                last_dim_size, dim, end_sync);
 }
 
 void fused_allreduce_rmsnorm(fptr_t _fa,
@@ -515,7 +523,8 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
                              int64_t reg_ptr, int64_t reg_bytes,
                              bool use_1stage,
                              bool gemma_norm,
-                             std::optional<aiter_tensor_t> zero_fill)
+                             std::optional<aiter_tensor_t> zero_fill,
+                             bool end_sync)
 {
     HipDeviceGuard device_guard(inp.device_id);
     hipStream_t stream = aiter::getCurrentHIPStream();
@@ -545,7 +554,7 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
                                  (void*)reg_ptr, res_inp.data_ptr(), res_out.data_ptr(),
                                  out.data_ptr(), nullptr, w.data_ptr(),
                                  dtype, (float)eps, m, input_n, n, out_n, use_1stage,
-                                 gemma_norm, zero_fill_ptr, zero_fill_elems);
+                                 gemma_norm, zero_fill_ptr, zero_fill_elems, end_sync);
     }
     else
     {
@@ -553,7 +562,7 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
                                  inp.data_ptr(), res_inp.data_ptr(), res_out.data_ptr(),
                                  out.data_ptr(), nullptr, w.data_ptr(),
                                  dtype, (float)eps, m, input_n, n, out_n, use_1stage,
-                                 gemma_norm, zero_fill_ptr, zero_fill_elems);
+                                 gemma_norm, zero_fill_ptr, zero_fill_elems, end_sync);
     }
 }
 
@@ -567,7 +576,8 @@ void fused_allreduce_rmsnorm_pad(fptr_t _fa,
                                  int64_t reg_ptr, int64_t reg_bytes,
                                  bool use_1stage,
                                  bool gemma_norm,
-                                 std::optional<aiter_tensor_t> zero_fill)
+                                 std::optional<aiter_tensor_t> zero_fill,
+                                 bool end_sync)
 {
     HipDeviceGuard device_guard(inp.device_id);
     hipStream_t stream = aiter::getCurrentHIPStream();
@@ -596,7 +606,7 @@ void fused_allreduce_rmsnorm_pad(fptr_t _fa,
                                  (void*)reg_ptr, res_inp.data_ptr(), res_out.data_ptr(),
                                  out.data_ptr(), nullptr, w.data_ptr(),
                                  dtype, (float)eps, m, input_n, n, out_n, use_1stage,
-                                 gemma_norm, zero_fill_ptr, zero_fill_elems);
+                                 gemma_norm, zero_fill_ptr, zero_fill_elems, end_sync);
     }
     else
     {
@@ -604,7 +614,7 @@ void fused_allreduce_rmsnorm_pad(fptr_t _fa,
                                  inp.data_ptr(), res_inp.data_ptr(), res_out.data_ptr(),
                                  out.data_ptr(), nullptr, w.data_ptr(),
                                  dtype, (float)eps, m, input_n, n, out_n, use_1stage,
-                                 gemma_norm, zero_fill_ptr, zero_fill_elems);
+                                 gemma_norm, zero_fill_ptr, zero_fill_elems, end_sync);
     }
 }
 
@@ -618,7 +628,8 @@ void fused_allreduce_rmsnorm_quant(fptr_t _fa,
                                    double eps,
                                    int64_t reg_ptr, int64_t reg_bytes,
                                    bool use_1stage,
-                                   bool gemma_norm)
+                                   bool gemma_norm,
+                                   bool end_sync)
 {
     HipDeviceGuard device_guard(inp.device_id);
     hipStream_t stream = aiter::getCurrentHIPStream();
@@ -639,7 +650,7 @@ void fused_allreduce_rmsnorm_quant(fptr_t _fa,
                                  (void*)reg_ptr, res_inp.data_ptr(), res_out.data_ptr(),
                                  out.data_ptr(), scale_out.data_ptr(), w.data_ptr(),
                                  dtype, (float)eps, m, input_n, n, n, use_1stage,
-                                 gemma_norm, nullptr, 0);
+                                 gemma_norm, nullptr, 0, end_sync);
     }
     else
     {
@@ -647,7 +658,7 @@ void fused_allreduce_rmsnorm_quant(fptr_t _fa,
                                  inp.data_ptr(), res_inp.data_ptr(), res_out.data_ptr(),
                                  out.data_ptr(), scale_out.data_ptr(), w.data_ptr(),
                                  dtype, (float)eps, m, input_n, n, n, use_1stage,
-                                 gemma_norm, nullptr, 0);
+                                 gemma_norm, nullptr, 0, end_sync);
     }
 }
 
@@ -663,7 +674,8 @@ void fused_allreduce_rmsnorm_quant_per_group(fptr_t _fa,
                                              int64_t reg_ptr, int64_t reg_bytes,
                                              bool use_1stage,
                                              int64_t bf16_out_ptr,
-                                             bool transpose_scale)
+                                             bool transpose_scale,
+                                             bool end_sync)
 {
     HipDeviceGuard device_guard(inp.device_id);
     hipStream_t stream = aiter::getCurrentHIPStream();
@@ -701,7 +713,7 @@ void fused_allreduce_rmsnorm_quant_per_group(fptr_t _fa,
             reinterpret_cast<float*>(scale_out.data_ptr()),
             reinterpret_cast<opus::bf16_t*>(w.data_ptr()),
             (float)eps, m, n, (int)group_size, use_1stage,
-            reinterpret_cast<opus::bf16_t*>(bf16_out), transpose_scale);
+            reinterpret_cast<opus::bf16_t*>(bf16_out), transpose_scale, end_sync);
         break;
     }
 #endif
@@ -715,7 +727,7 @@ void fused_allreduce_rmsnorm_quant_per_group(fptr_t _fa,
             reinterpret_cast<float*>(scale_out.data_ptr()),
             reinterpret_cast<opus::fp16_t*>(w.data_ptr()),
             (float)eps, m, n, (int)group_size, use_1stage,
-            reinterpret_cast<opus::fp16_t*>(bf16_out), transpose_scale);
+            reinterpret_cast<opus::fp16_t*>(bf16_out), transpose_scale, end_sync);
         break;
     }
     default:
@@ -734,7 +746,8 @@ void fused_allreduce_rmsnorm_mxfp4_quant(fptr_t _fa,
                                          double eps,
                                          int64_t reg_ptr, int64_t reg_bytes,
                                          bool use_1stage,
-                                         int64_t bf16_out_ptr)
+                                         int64_t bf16_out_ptr,
+                                         bool end_sync)
 {
     HipDeviceGuard device_guard(inp.device_id);
     hipStream_t stream = aiter::getCurrentHIPStream();
@@ -771,7 +784,7 @@ void fused_allreduce_rmsnorm_mxfp4_quant(fptr_t _fa,
             reinterpret_cast<uint8_t*>(scale_out.data_ptr()),
             reinterpret_cast<opus::bf16_t*>(w.data_ptr()),
             (float)eps, m, n, use_1stage,
-            reinterpret_cast<opus::bf16_t*>(bf16_out));
+            reinterpret_cast<opus::bf16_t*>(bf16_out), end_sync);
         break;
     }
 #endif
@@ -785,7 +798,7 @@ void fused_allreduce_rmsnorm_mxfp4_quant(fptr_t _fa,
             reinterpret_cast<uint8_t*>(scale_out.data_ptr()),
             reinterpret_cast<opus::fp16_t*>(w.data_ptr()),
             (float)eps, m, n, use_1stage,
-            reinterpret_cast<opus::fp16_t*>(bf16_out));
+            reinterpret_cast<opus::fp16_t*>(bf16_out), end_sync);
         break;
     }
     default:

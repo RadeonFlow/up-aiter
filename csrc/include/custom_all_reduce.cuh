@@ -689,7 +689,8 @@ __global__ void __launch_bounds__(512, 1)
  * */
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(512, 1) allgather_naive(
-    RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int size)
+    RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int size,
+    bool do_end_sync)
 {
     constexpr int tnum_gpu = THREAD_NUM / ngpus;
     int warp_id            = threadIdx.x / tnum_gpu;
@@ -710,12 +711,14 @@ __global__ void __launch_bounds__(512, 1) allgather_naive(
         int write_idx     = warp_id * size + idx;
         result[write_idx] = ptrs[warp_id][idx];
     }
-    end_sync<ngpus, true>(sg, self_sg, rank);
+    if(do_end_sync)
+        end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(512, 1) allgather_vec(
-    RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int size)
+    RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int size,
+    bool do_end_sync)
 {
     constexpr int tnum_gpu  = THREAD_NUM / ngpus;
     constexpr int pack_size = 16 / sizeof(T);
@@ -738,7 +741,8 @@ __global__ void __launch_bounds__(512, 1) allgather_vec(
         int write_idx                                   = warp_id * size + idx;
         *(reinterpret_cast<P*>(&result[0]) + write_idx) = ptrs[warp_id][idx];
     }
-    end_sync<ngpus, true>(sg, self_sg, rank);
+    if(do_end_sync)
+        end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
 template <typename T, int ngpus>
@@ -748,7 +752,8 @@ __global__ void __launch_bounds__(512, 1) allgather_lastdim(RankData* _dp,
                                                             T* __restrict__ result,
                                                             int rank,
                                                             int size,
-                                                            int last_dim_size)
+                                                            int last_dim_size,
+                                                            bool do_end_sync)
 {
     constexpr int tnum_gpu  = THREAD_NUM / ngpus;
     constexpr int pack_size = 16 / sizeof(T);
@@ -775,7 +780,8 @@ __global__ void __launch_bounds__(512, 1) allgather_lastdim(RankData* _dp,
         int write_idx                                   = (ngpus * y + warp_id) * last_dim_size + x;
         *(reinterpret_cast<P*>(&result[0]) + write_idx) = ptrs[warp_id][idx];
     }
-    end_sync<ngpus, true>(sg, self_sg, rank);
+    if(do_end_sync)
+        end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
 // ========== reduce_scatter kernel start ==========
@@ -794,7 +800,8 @@ __global__ void __launch_bounds__(512, 1) allgather_lastdim(RankData* _dp,
 // cond: total_elems % (ngpus * pack_size) == 0
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(512, 1) reduce_scatter_split_first_dim(
-    RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int range)
+    RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int range,
+    bool do_end_sync)
 {
     int tid                 = blockIdx.x * blockDim.x + threadIdx.x;
     int stride              = blockDim.x * gridDim.x;
@@ -817,7 +824,8 @@ __global__ void __launch_bounds__(512, 1) reduce_scatter_split_first_dim(
         *(reinterpret_cast<P*>(result) + store_index) =
             packed_reduce<P, ngpus, A>(ptrs, load_index);
     }
-    end_sync<ngpus, true>(sg, self_sg, rank);
+    if(do_end_sync)
+        end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
 // reduce_scatter, scatter on last dim — naive (non-vectorized) fallback.
@@ -828,7 +836,8 @@ __global__ void __launch_bounds__(512, 1) reduce_scatter_split_first_dim(
 // shape: input (m, n) -> output (m, n / ngpus)
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(256, 1) reduce_scatter_split_lastdim_naive(
-    RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int m, int n
+    RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int m, int n,
+    bool do_end_sync
 )
 {
   int size = m * n / ngpus;
@@ -855,7 +864,8 @@ __global__ void __launch_bounds__(256, 1) reduce_scatter_split_lastdim_naive(
     }
     result[i] = downcast_s<T>(rslt_reg);
   }
-  end_sync<ngpus, true>(sg, self_sg, rank);
+  if(do_end_sync)
+    end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
 // reduce_scatter, scatter on last dim — vectorized (16B / thread).
@@ -864,7 +874,8 @@ __global__ void __launch_bounds__(256, 1) reduce_scatter_split_lastdim_naive(
 // shape: input (m, n) -> output (m, n / ngpus)
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(256, 1) reduce_scatter_split_lastdim(
-    RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int m, int n
+    RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int m, int n,
+    bool do_end_sync
 )
 {
   constexpr int pack_size = 16 / sizeof(T);
@@ -889,7 +900,8 @@ __global__ void __launch_bounds__(256, 1) reduce_scatter_split_lastdim(
     int load_index = index_y * packed_dim_n + rank * splited_n + index_x;
     *(reinterpret_cast<P*>(result) + i) = packed_reduce<P, ngpus, A>(ptrs, load_index);
   }
-  end_sync<ngpus, true>(sg, self_sg, rank);
+  if(do_end_sync)
+    end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
 // reduce_scatter, scatter on middle dim — naive (non-vectorized) fallback.
@@ -899,7 +911,8 @@ __global__ void __launch_bounds__(256, 1) reduce_scatter_split_lastdim(
 // shape: input (m, n, k) -> output (m, n / ngpus, k)
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(256, 1) reduce_scatter_split_middim_naive(
-    RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int m, int n, int k
+    RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int m, int n, int k,
+    bool do_end_sync
 )
 {
   int size = m * n * k / ngpus;
@@ -927,7 +940,8 @@ __global__ void __launch_bounds__(256, 1) reduce_scatter_split_middim_naive(
     }
     result[i] = downcast_s<T>(rslt_reg);
   }
-  end_sync<ngpus, true>(sg, self_sg, rank);
+  if(do_end_sync)
+    end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
 // reduce_scatter, scatter on middle dim — vectorized (16B / thread along k).
@@ -936,7 +950,8 @@ __global__ void __launch_bounds__(256, 1) reduce_scatter_split_middim_naive(
 // shape: input (m, n, k) -> output (m, n / ngpus, k)
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(256, 1) reduce_scatter_split_middim(
-    RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int m, int n, int k
+    RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int m, int n, int k,
+    bool do_end_sync
 )
 {
   constexpr int pack_size = 16 / sizeof(T);
@@ -962,7 +977,8 @@ __global__ void __launch_bounds__(256, 1) reduce_scatter_split_middim(
     int load_index = index_m * (n * packed_dim_k) + (rank * splited_n + index_n) * packed_dim_k + index_k;
     *(reinterpret_cast<P*>(result) + i) = packed_reduce<P, ngpus, A>(ptrs, load_index);
   }
-  end_sync<ngpus, true>(sg, self_sg, rank);
+  if(do_end_sync)
+    end_sync<ngpus, true>(sg, self_sg, rank);
 }
 // ========== reduce_scatter kernel end ==========
 
@@ -1957,7 +1973,8 @@ __global__ void __launch_bounds__(1024, 1)
                                    int input_hidden_dim,
                                    int hidden_dim,
                                    int out_hidden_dim,
-                                   float eps)
+                                   float eps,
+                                   bool do_end_sync)
 {
     constexpr int pack_size = 16 / sizeof(T);
     int block_size          = hidden_dim / pack_size;
@@ -2057,7 +2074,8 @@ __global__ void __launch_bounds__(1024, 1)
             *reinterpret_cast<OP*>(output + out_idx) = zero_pack;
         }
     }
-    end_sync<ngpus, true>(sg, self_sg, rank);
+    if(do_end_sync)
+        end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
 // Per-group quant variant of the 1-stage fused allreduce+rmsnorm kernel.
@@ -2077,7 +2095,8 @@ __global__ void __launch_bounds__(1024, 1)
                                              int hidden_dim,
                                              int group_size,
                                              float eps,
-                                             T* __restrict__ bf16_output)
+                                             T* __restrict__ bf16_output,
+                                             bool do_end_sync)
 {
     constexpr int pack_size = 16 / sizeof(T);
     int block_size          = hidden_dim / pack_size;
@@ -2141,7 +2160,8 @@ __global__ void __launch_bounds__(1024, 1)
             acc, weight_p, hidden_dim, eps, idx, tidx, padded_block_size,
             group_size, output, scale_out, active, bf16_output, token_num);
     }
-    end_sync<ngpus, true>(sg, self_sg, rank);
+    if(do_end_sync)
+        end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
 template <typename T, typename OutT, int NGPUS>
@@ -2150,7 +2170,7 @@ void allreduce_fusion_kernel_1stage_per_group_launcher(
     T* residual_inp, T* residual_out, OutT* output, T* weight,
     float* scale_out, int size, int hidden_dim, int group_size,
     float eps, hipStream_t stream, T* bf16_output = nullptr,
-    bool transpose_scale = false)
+    bool transpose_scale = false, bool end_sync = true)
 {
     auto pack_size  = 16 / sizeof(T);
     int block_size  = hidden_dim / pack_size;
@@ -2169,7 +2189,7 @@ void allreduce_fusion_kernel_1stage_per_group_launcher(
                                          residual_inp, residual_out,
                                          output, weight, scale_out,
                                          size, hidden_dim, group_size, eps,
-                                         bf16_output);
+                                         bf16_output, end_sync);
     };
     if(transpose_scale)
         launch(std::true_type{});
@@ -2191,7 +2211,8 @@ __global__ void __launch_bounds__(1024, 1)
                                          int size,
                                          int hidden_dim,
                                          float eps,
-                                         T* __restrict__ bf16_output)
+                                         T* __restrict__ bf16_output,
+                                         bool do_end_sync)
 {
     constexpr int pack_size = 16 / sizeof(T);
     int block_size          = hidden_dim / pack_size;
@@ -2251,7 +2272,8 @@ __global__ void __launch_bounds__(1024, 1)
             acc, weight_p, hidden_dim, eps, idx, tidx, padded_block_size,
             output, scale_out, active, bf16_output);
     }
-    end_sync<ngpus, true>(sg, self_sg, rank);
+    if(do_end_sync)
+        end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
 template <typename T, int NGPUS>
@@ -2259,7 +2281,7 @@ void allreduce_fusion_kernel_1stage_mxfp4_launcher(
     RankData* _dp, RankSignals sg, Signal* self_sg, int rank,
     T* residual_inp, T* residual_out, uint8_t* output, T* weight,
     uint8_t* scale_out, int size, int hidden_dim, float eps,
-    hipStream_t stream, T* bf16_output = nullptr)
+    hipStream_t stream, T* bf16_output = nullptr, bool end_sync = true)
 {
     auto pack_size  = 16 / sizeof(T);
     int block_size  = hidden_dim / pack_size;
@@ -2272,7 +2294,7 @@ void allreduce_fusion_kernel_1stage_mxfp4_launcher(
                                      residual_inp, residual_out,
                                      output, weight, scale_out,
                                      size, hidden_dim, eps,
-                                     bf16_output);
+                                     bf16_output, end_sync);
 }
 
 // 2-stage variant of the MXFP4 fused AR+RMSNorm+quant kernel.
@@ -2433,7 +2455,8 @@ void allreduce_fusion_kernel_1stage_launcher(RankData* _dp,
                                              float eps,
                                              hipStream_t stream,
                                              T* zero_fill = nullptr,
-                                             int zero_fill_elems = 0)
+                                             int zero_fill_elems = 0,
+                                             bool end_sync = true)
 {
     constexpr int PACK_SIZE  = 16 / sizeof(T);
     constexpr int WARP_SIZE  = 32;
@@ -2464,7 +2487,8 @@ void allreduce_fusion_kernel_1stage_launcher(RankData* _dp,
                                                     input_hidden_dim,
                                                     hidden_dim,
                                                     out_hidden_dim,
-                                                    eps);
+                                                    eps,
+                                                    end_sync);
 }
 
 template <typename T, int PACK_SIZE>
@@ -3914,7 +3938,8 @@ class CustomAllreduce
 template <typename T>
 void dispatchReduceScatter(hipStream_t stream, T* input, T* output,
                            int m, int n, int k,
-                           ReduceScatterSplitDim split_dim)
+                           ReduceScatterSplitDim split_dim,
+                           bool end_sync = true)
 {
     RankData* ptrs          = get_buffer_RD(stream, input);
     constexpr int pack_size = 16 / sizeof(T);
@@ -3931,15 +3956,15 @@ void dispatchReduceScatter(hipStream_t stream, T* input, T* output,
         {
         case 8:
             reduce_scatter_split_first_dim<T, 8>
-                <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, range);
+                <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, range, end_sync);
             break;
         case 4:
             reduce_scatter_split_first_dim<T, 4>
-                <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, range);
+                <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, range, end_sync);
             break;
         case 2:
             reduce_scatter_split_first_dim<T, 2>
-                <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, range);
+                <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, range, end_sync);
             break;
         default: printf("reduce_scatter world_size error!\n");
         }
@@ -3953,23 +3978,34 @@ void dispatchReduceScatter(hipStream_t stream, T* input, T* output,
                         : (n * k) / world_size_;
         dim3 block(256);
         dim3 grid(std::min(kGridCap, (size + 255) / 256));
-#define LAUNCH_LAST(NG)                                                                       \
-    do {                                                                                      \
-        if(vec)                                                                               \
-            reduce_scatter_split_lastdim<T, NG>                                               \
-                <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, n, k);       \
-        else                                                                                  \
-            reduce_scatter_split_lastdim_naive<T, NG>                                         \
-                <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, n, k);       \
-    } while(0)
         switch(world_size_)
         {
-        case 8: LAUNCH_LAST(8); break;
-        case 4: LAUNCH_LAST(4); break;
-        case 2: LAUNCH_LAST(2); break;
+        case 8:
+            if(vec)
+                reduce_scatter_split_lastdim<T, 8>
+                    <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, n, k, end_sync);
+            else
+                reduce_scatter_split_lastdim_naive<T, 8>
+                    <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, n, k, end_sync);
+            break;
+        case 4:
+            if(vec)
+                reduce_scatter_split_lastdim<T, 4>
+                    <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, n, k, end_sync);
+            else
+                reduce_scatter_split_lastdim_naive<T, 4>
+                    <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, n, k, end_sync);
+            break;
+        case 2:
+            if(vec)
+                reduce_scatter_split_lastdim<T, 2>
+                    <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, n, k, end_sync);
+            else
+                reduce_scatter_split_lastdim_naive<T, 2>
+                    <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, n, k, end_sync);
+            break;
         default: printf("reduce_scatter world_size error!\n");
         }
-#undef LAUNCH_LAST
         break;
     }
     case ReduceScatterSplitDim::kMid: {
@@ -3979,23 +4015,34 @@ void dispatchReduceScatter(hipStream_t stream, T* input, T* output,
                         : (m * n * k) / world_size_;
         dim3 block(256);
         dim3 grid(std::min(kGridCap, (size + 255) / 256));
-#define LAUNCH_MID(NG)                                                                        \
-    do {                                                                                      \
-        if(vec)                                                                               \
-            reduce_scatter_split_middim<T, NG>                                                \
-                <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, m, n, k);    \
-        else                                                                                  \
-            reduce_scatter_split_middim_naive<T, NG>                                          \
-                <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, m, n, k);    \
-    } while(0)
         switch(world_size_)
         {
-        case 8: LAUNCH_MID(8); break;
-        case 4: LAUNCH_MID(4); break;
-        case 2: LAUNCH_MID(2); break;
+        case 8:
+            if(vec)
+                reduce_scatter_split_middim<T, 8>
+                    <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, m, n, k, end_sync);
+            else
+                reduce_scatter_split_middim_naive<T, 8>
+                    <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, m, n, k, end_sync);
+            break;
+        case 4:
+            if(vec)
+                reduce_scatter_split_middim<T, 4>
+                    <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, m, n, k, end_sync);
+            else
+                reduce_scatter_split_middim_naive<T, 4>
+                    <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, m, n, k, end_sync);
+            break;
+        case 2:
+            if(vec)
+                reduce_scatter_split_middim<T, 2>
+                    <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, m, n, k, end_sync);
+            else
+                reduce_scatter_split_middim_naive<T, 2>
+                    <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, m, n, k, end_sync);
+            break;
         default: printf("reduce_scatter world_size error!\n");
         }
-#undef LAUNCH_MID
         break;
     }
     default: printf("reduce_scatter split_dim error!\n");
@@ -4004,7 +4051,8 @@ void dispatchReduceScatter(hipStream_t stream, T* input, T* output,
 
 template <typename T>
 void dispatchAllGather(
-    hipStream_t stream, T* input, T* output, int size, int last_dim_size, int gather_dim)
+    hipStream_t stream, T* input, T* output, int size, int last_dim_size, int gather_dim,
+    bool end_sync = true)
 {
     RankData* ptrs = get_buffer_RD(stream, input);
     auto d         = 16 / sizeof(T);
@@ -4021,15 +4069,15 @@ void dispatchAllGather(
             {
             case 8:
                 allgather_naive<T, 8>
-                    <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
+                    <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size, end_sync);
                 break;
             case 4:
                 allgather_naive<T, 4>
-                    <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
+                    <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size, end_sync);
                 break;
             case 2:
                 allgather_naive<T, 2>
-                    <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
+                    <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size, end_sync);
                 break;
             default: printf("allgather world_size error\n");
             }
@@ -4044,15 +4092,15 @@ void dispatchAllGather(
             {
             case 8:
                 allgather_vec<T, 8>
-                    <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
+                    <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size, end_sync);
                 break;
             case 4:
                 allgather_vec<T, 4>
-                    <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
+                    <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size, end_sync);
                 break;
             case 2:
                 allgather_vec<T, 2>
-                    <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
+                    <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size, end_sync);
                 break;
             default: printf("allgather world_size error\n");
             }
@@ -4068,15 +4116,15 @@ void dispatchAllGather(
         {
         case 8:
             allgather_lastdim<T, 8><<<grid, block, 0, stream>>>(
-                ptrs, sg_, self_sg_, output, rank_, size, last_dim_size);
+                ptrs, sg_, self_sg_, output, rank_, size, last_dim_size, end_sync);
             break;
         case 4:
             allgather_lastdim<T, 4><<<grid, block, 0, stream>>>(
-                ptrs, sg_, self_sg_, output, rank_, size, last_dim_size);
+                ptrs, sg_, self_sg_, output, rank_, size, last_dim_size, end_sync);
             break;
         case 2:
             allgather_lastdim<T, 2><<<grid, block, 0, stream>>>(
-                ptrs, sg_, self_sg_, output, rank_, size, last_dim_size);
+                ptrs, sg_, self_sg_, output, rank_, size, last_dim_size, end_sync);
             break;
         default: printf("allgather world_size error\n");
         }
@@ -4098,7 +4146,8 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
                                    bool use_1stage,
                                    bool gemma_norm = false,
                                    T* zero_fill = nullptr,
-                                   int zero_fill_elems = 0)
+                                   int zero_fill_elems = 0,
+                                   bool end_sync = true)
 {
     auto d   = 16 / sizeof(T);
     int size = m * n;
@@ -4150,7 +4199,8 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
                                                                        eps,                \
                                                                        stream,             \
                                                                        zero_fill,          \
-                                                                       zero_fill_elems);   \
+                                                                       zero_fill_elems,   \
+                                                                       end_sync);          \
         }                                                                                  \
         else                                                                               \
         {                                                                                  \
@@ -4170,7 +4220,8 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
                                                                         eps,               \
                                                                         stream,            \
                                                                         zero_fill,         \
-                                                                        zero_fill_elems);  \
+                                                                        zero_fill_elems,  \
+                                                                        end_sync);         \
         }                                                                                  \
         return;                                                                            \
     }
@@ -4451,7 +4502,8 @@ void dispatchFusedAllReduceRMSNormQuant(hipStream_t stream,
                                         int m,
                                         int n,
                                         bool use_1stage,
-                                        bool gemma_norm = false)
+                                        bool gemma_norm = false,
+                                        bool end_sync = true)
 {
     auto d   = 16 / sizeof(T);
     int size = m * n;
@@ -4474,12 +4526,13 @@ void dispatchFusedAllReduceRMSNormQuant(hipStream_t stream,
         {                                                                               \
             gemma_template_launcher(ptrs, sg_, self_sg_, rank_, residual_inp,           \
                                     residual_out, output, weight, scale_out, size, n, n, \
-                                    n, eps, stream);                                    \
+                                    n, eps, stream, nullptr, 0, end_sync);                          \
         }                                                                               \
         else                                                                            \
         {                                                                               \
             template_launcher(ptrs, sg_, self_sg_, rank_, residual_inp, residual_out,    \
-                              output, weight, scale_out, size, n, n, n, eps, stream);   \
+                              output, weight, scale_out, size, n, n, n, eps, stream,    \
+                              nullptr, 0, end_sync);                                                \
         }                                                                               \
     } while(0)
 
@@ -4554,7 +4607,8 @@ void dispatchFusedAllReduceRMSNormQuantPerGroup(hipStream_t stream,
                                                 int group_size,
                                                 bool use_1stage,
                                                 T* bf16_output = nullptr,
-                                                bool transpose_scale = false)
+                                                bool transpose_scale = false,
+                                                bool end_sync = true)
 {
     auto d   = 16 / sizeof(T);
     int size = m * n;
@@ -4631,7 +4685,7 @@ void dispatchFusedAllReduceRMSNormQuantPerGroup(hipStream_t stream,
         allreduce_fusion_kernel_1stage_per_group_launcher<T, QT, NGPUS>(                   \
             ptrs, sg_, self_sg_, rank_,                                                     \
             residual_inp, residual_out, output, weight, scale_out,                          \
-            size, n, group_size, eps, stream, bf16_output, transpose_scale);               \
+            size, n, group_size, eps, stream, bf16_output, transpose_scale, end_sync);     \
         return;                                                                             \
     }                                                                                      \
     else if(n_constrain && (size * sizeof(T) <= 512 * 1024))                               \
@@ -4681,7 +4735,8 @@ void dispatchFusedAllReduceRMSNormQuantMXFP4(hipStream_t stream,
                                              int m,
                                              int n,
                                              bool use_1stage,
-                                             T* bf16_output = nullptr)
+                                             T* bf16_output = nullptr,
+                                             bool end_sync = true)
 {
     auto d   = 16 / sizeof(T);
     int size = m * n;
@@ -4722,7 +4777,7 @@ void dispatchFusedAllReduceRMSNormQuantMXFP4(hipStream_t stream,
     {                                                                                        \
         allreduce_fusion_kernel_1stage_mxfp4_launcher<T, NGPUS>(                             \
             ptrs, sg_, self_sg_, rank_, residual_inp, residual_out, output, weight,           \
-            scale_out, size, n, eps, stream, bf16_output);                                    \
+            scale_out, size, n, eps, stream, bf16_output, end_sync);                          \
         return;                                                                              \
     }                                                                                        \
     else                                                                                     \
