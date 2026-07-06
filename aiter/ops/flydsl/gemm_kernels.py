@@ -889,12 +889,12 @@ def _compile_flydsl_hgemm(
             sema, sig = _get_fixed_tile_sig_sem(a.device)
             return _run_compiled(
                 kernel,
-                _ptr_view_safe(out),
-                _ptr_view_safe(a),
-                _ptr_view_safe(b),
+                ptr_arg(out),
+                ptr_arg(a),
+                ptr_arg(b),
                 runtime_m,
-                _ptr_view_safe(sema),
-                _ptr_view_safe(sig),
+                ptr_arg(sema),
+                ptr_arg(sig),
                 fx.Stream(launch_stream),
             )
 
