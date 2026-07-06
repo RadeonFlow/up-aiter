@@ -493,7 +493,7 @@ def compile_splitk_hgemm_fixed_tile(
 _SIG_SEM_CACHE = {}
 
 
-def _get_4wave_sig_sem(device):
+def _get_fixed_tile_sig_sem(device):
     """Persistent per-device signal/semaphore buffers, reset in-kernel."""
     import torch
 
@@ -516,7 +516,7 @@ def splitk_hgemm_fixed_tile(C, A, B, BN, SPLITK, BM, BK=128, stream=None):
 
     N, K, m = B.shape[0], A.shape[1], int(A.shape[0])
     launch = compile_splitk_hgemm_fixed_tile(N, K, BN, SPLITK, BM, BK=BK, dtype="bf16")
-    sema, sig = _get_4wave_sig_sem(C.device)
+    sema, sig = _get_fixed_tile_sig_sem(C.device)
     s = torch.cuda.current_stream() if stream is None else stream
 
     def _pv(t):
