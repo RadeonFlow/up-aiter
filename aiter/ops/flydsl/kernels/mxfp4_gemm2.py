@@ -570,8 +570,29 @@ def _gemm2_body(
                             [a[i1][1], b_J1, accm[i1][J], 4, 4, 3, sa, 2 + in_b, sb],
                         )
 
-    def _kloop_fence():
-        gpu.barrier()
+    # In the pipelined main loop each iteration prefetches the next tile's A
+    # into LDS (one buffer_load_lds batch of _kSubBlocks loads) AFTER the fence.
+    # So at a steady-loop fence exactly one prefetch batch is outstanding beyond
+    # the batch feeding this tile's ds_read. A full ``gpu.barrier()`` drains
+    # vmcnt(0), also waiting on that newest prefetch and serializing it against
+    # the MFMAs. Relax to vmcnt(_kSubBlocks): VMEM completes in issue order, so
+    # this still guarantees the read-slot's loads landed before the barrier
+    # makes them cross-wave visible, while letting the next tile's prefetch
+    # overlap the current MFMA cluster. The tail loop issues NO further
+    # prefetch, so its last fence must fully drain (the newest prefetch there IS
+    # the data being read) -> keep gpu.barrier() there via relax=False.
+    def _kloop_fence(relax=False):
+        if const_expr(relax):
+            llvm.InlineAsmOp(
+                None,
+                [],
+                f"s_waitcnt vmcnt({_kSubBlocks}) lgkmcnt(0)",
+                "",
+                has_side_effects=True,
+            )
+            rocdl.s_barrier()
+        else:
+            gpu.barrier()
 
     if const_expr(_K_TILES_TOTAL <= kStages):
         a_scale_v = [load_a_scale_tile(kt) for kt in range_constexpr(_K_TILES_TOTAL)]
@@ -594,7 +615,7 @@ def _gemm2_body(
             slot = kt % _aStages
             next_kt = kStages + OFFSET
             write_slot = next_kt % _aStages
-            _kloop_fence()
+            _kloop_fence(relax=True)
             a = issue_a_ds_read(slot)
             issue_a_load_lds(write_slot, next_kt)
             a_scale_sub = [a_scale_v[kt][sub] for sub in range_constexpr(_kSubBlocks)]

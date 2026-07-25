@@ -27,6 +27,7 @@ SHAPES = [
     (256, 3072, 768, 8),  # minimax_b (H=3072)
     (512, 4096, 256, 10),  # qwen35_397b (H=4096, TOPK=10)
     (48, 7168, 3072, 6),  # dsv4_ep8
+    (96, 7168, 2048, 8),  # Kimi-K2.5 EP4 (routed 384/4, shared separate, TOPK=8)
     (384, 7168, 1536, 6),  # dsv4_tp2
     (384, 7168, 768, 6),  # dsv4_tp4
     (384, 7168, 512, 6),  # dsv4_tp6 (and dsv4_tp8: INTER 384→512 padded)

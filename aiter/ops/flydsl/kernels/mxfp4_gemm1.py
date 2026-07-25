@@ -564,9 +564,9 @@ def _gemm1_body(
                 issue_b_load_j(b[K_C], K_C, j)
             issue_b_scale_load(b_scale_v[K_C], K_C)
 
-    for OFFSET in range_constexpr(kUnroll):
-        K_C = kStages + OFFSET
-        read_slot = OFFSET % kAStages
+    for OFFSET in range_constexpr(kUnroll): #  28
+        K_C = kStages + OFFSET # 2 + i
+        read_slot = OFFSET % kAStages # 
         write_slot = K_C % kAStages
         slot_b = OFFSET % kStages
         gpu.barrier()
