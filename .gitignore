@@ -92,3 +92,4 @@ aiter/ops/opus/configs/
 # vim swaps
 *.swo
 *.swp
+aiter/jit/flydsl_cache
