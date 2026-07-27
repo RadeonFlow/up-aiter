@@ -564,21 +564,31 @@ def _gemm1_body(
                 issue_b_load_j(b[K_C], K_C, j)
             issue_b_scale_load(b_scale_v[K_C], K_C)
 
-    for OFFSET in range_constexpr(kUnroll): #  28
+    for OFFSET in range_constexpr(kUnroll): #  28 主循环.
         K_C = kStages + OFFSET # 2 + i
         read_slot = OFFSET % kAStages # 
         write_slot = K_C % kAStages
         slot_b = OFFSET % kStages
-        gpu.barrier()
+        # Steady fence: A read from read_slot was written by iter OFFSET-2
+        # (already landed), so barrier need NOT wait on this iter's 14 in-flight
+        # VMEM. Compiler can't see the double-buffer -> drains to vmcnt(10);
+        # relax to vmcnt(14) (don't gate VMEM). s_barrier keeps 4-wave sync.
         if const_expr(BM == 128):
-            asc_cur = issue_a_scale_ds_read(K_C - kStages)
-            a_cur = issue_a_ds_read(read_slot)
+            llvm.InlineAsmOp(
+                None, [], "s_waitcnt vmcnt(14)", "", has_side_effects=True
+            )
+            rocdl.s_barrier()
         else:
+            gpu.barrier()
+        if const_expr(BM == 128):
+            asc_cur = issue_a_scale_ds_read(K_C - kStages) # 4 次 read.
+            a_cur = issue_a_ds_read(read_slot)
+        else: # Fales
             a_cur = issue_a_ds_read(read_slot)
             asc_cur = issue_a_scale_ds_read(K_C - kStages)
-        if const_expr(not inline_quant):
-            issue_a_load_lds(write_slot, K_C)
-        if const_expr(inline_quant):
+        if const_expr(not inline_quant): # True
+            issue_a_load_lds(write_slot, K_C) # d2s
+        if const_expr(inline_quant): # False
             h_v0 = inline_quant_load_kt(0, K_C, cached_row_inline[0])
             h_v1 = inline_quant_load_kt(1, K_C, cached_row_inline[0])
             rocdl.sched_barrier(0)
@@ -592,9 +602,9 @@ def _gemm1_body(
             if const_expr(BM != 128):
                 rocdl.s_setprio(0)
             rocdl.sched_barrier(0)
-            issue_b_load_j(b[slot_b], K_C, J)
+            issue_b_load_j(b[slot_b], K_C, J) # 2 * B128
             rocdl.sched_barrier(0)
-        issue_b_scale_load(b_scale_v[slot_b], K_C)
+        issue_b_scale_load(b_scale_v[slot_b], K_C) # 2 * B32?
         if const_expr(inline_quant):
             scale_accum = [fx.Int32(0)]
             _inline_quant_core_pair(
@@ -735,7 +745,7 @@ def _gemm1_body(
 
 
 def _bm_constants(BM, BN, KH_TILE, K_TILES_TOTAL):
-    kAStages = 2 if BM == 128 else 3
+    kAStages = 3
     kSubBlocks = 1 if BM < 32 else BM // 32
     kMChunks = kmchunks_for(BM)
     s_aq_bytes = kAStages * BM * KH_TILE
