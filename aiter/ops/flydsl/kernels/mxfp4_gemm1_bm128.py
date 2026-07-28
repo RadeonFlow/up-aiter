@@ -59,70 +59,15 @@ _ADSRD = False
 # fp4_gemm_4wave's ScaleLoaderLDS.
 _BSC_X4 = False
 
-# Thunk-interleaved steady loop: instead of a 19-ds_read block before the first
-# mfma, issue only what the first quad needs and weave the rest one per
-# _ILV_STRIDE mfma, so each load hides in an mfma execute shadow.
-_BDEEP = True
 # i-outer mfma order (for k: for i: for J) with every load woven in.
-# Requires _BDEEP: the B loads can only move once B is triple-buffered.
+# Requires the B triple-buffer: the B loads can only move once a load no
+# longer targets the buffer the mfma are reading.
 _IOUT = True
-_ILV = False
-_ILV_STRIDE = 2
 _BSC_TILES = 4  # K-tiles covered by one dwordx4 gather (1024 B / 256 B)
 _BSC_SLOTS = 2  # double buffer over groups of _BSC_TILES
 _BSC_WAVE_BYTES = 2 * _BSC_TILES * 256  # 2 mw x 4 tiles x 256 B = 2 KB
 _BSC_SLOT_BYTES = 4 * _BSC_WAVE_BYTES  # 4 waves = 8 KB
 _BSC_LDS_BYTES = _BSC_SLOTS * _BSC_SLOT_BYTES  # 16 KB
-
-
-def _build_thunk_plan(kMChunks, kSubBlocks):
-    """Compile-time (NON-traced) plan for the interleaved steady loop.
-
-    Must live outside @flyc.kernel: a `for` over a python list inside a traced
-    function gets rewritten into scf.for by the DSL tracer.
-
-    Returns (prologue, thunks):
-      prologue -- what the FIRST mfma quad of the NEXT iteration needs, so that
-        iteration can start issuing mfma immediately after its barrier.
-        mfma_cluster(J=0) consumes, in order, a[0][0] a[1][0] a[0][1] a[1][1]
-        with a_scale[0] -- M-blocks 0/1, both k-halves, plus A-scale sub 0.
-      thunks -- the rest of the NEXT iteration's A, plus this iteration's albd
-        refill, woven one per `stride` mfma across all 64 mfma of the current
-        iteration.
-
-    Why the loads must be for the NEXT iteration, not this one: within a single
-    J the 16 mfma already touch every one of the 8 M-blocks (mfma 4*s+{0,1,2,3}
-    reads a[2s][0] a[2s+1][0] a[2s][1] a[2s+1][1]). There is no slack to hoist
-    A[i] above its own consumer inside J=0 -- weaving this iteration's A at
-    stride 2 would fire a[2][0] after mfma#6 when mfma#4 already needs it.
-    fp4_gemm_4wave can interleave its own tile because one quad's 32 mfma reuse
-    only 4 A tiles (each across 4 j); we have no such reuse. Prefetching the
-    next tile instead gives the loads all 64 mfma to hide in.
-    Safe because kAStages=3: iteration OFFSET reads slot OFFSET%3, filled by
-    the albd of OFFSET-2 and published by the barrier at the top of OFFSET-1.
-
-    Ordering rules inside `thunks`:
-      * `albd` writes the A LDS write_slot. Only the iteration-top s_barrier
-        guarantees the other 3 waves are done reading it, so albd may not be
-        hoisted above that barrier -- but it is free to sit anywhere after it.
-        It targets slot (OFFSET+2)%3, a different buffer from the (OFFSET+1)%3
-        the prefetch ds_reads are reading, so the two do not race.
-      * `bld` overwrites b[slot_b], which EVERY mfma of this iteration reads
-        (WAR), so all 8 B loads stay after the last mfma of their J. Same for
-        the B-scale gather.
-    """
-    pro = [("asc", 0), ("a", 0, 0), ("a", 1, 0), ("a", 0, 1), ("a", 1, 1)]
-    th = []
-    for sub in range(kSubBlocks):
-        th.append(("albd", sub))
-    for sub in range(1, kSubBlocks):
-        th.append(("asc", sub))
-    for i in range(kMChunks):
-        for k in range(2):
-            if (i, k) in ((0, 0), (1, 0), (0, 1), (1, 1)):
-                continue
-            th.append(("a", i, k))
-    return pro, th
 
 
 def _mfma_weave_order(kMChunks, kSubBlocks):
@@ -235,34 +180,6 @@ def _pipe_alloc(pipe, shape):
 def _rotate_pipe(pipe):
     """pipe[0] <- pipe[1] (in place). Same rewriter caveat as _pipe_alloc."""
     pipe[0] = pipe[1]
-
-
-def _weave_run(act, ctx, fns, a_pipe, asc_pipe):
-    """Execute one weave action. `act` is a plain tuple from the compile-time
-    plan, `ctx` = (nxt_slot, nxt_kt, write_slot, K_C), `fns` = the three issue
-    helpers. Module-level so no closure over traced-function locals is needed.
-    """
-    nxt_slot, nxt_kt, write_slot, K_C = ctx
-    f_a, f_asc, f_albd = fns
-    if act[0] == "asc":
-        asc_pipe[1][act[1]] = f_asc(nxt_kt, act[1])
-    elif act[0] == "a":
-        a_pipe[1][act[1]][act[2]] = f_a(nxt_slot, act[1], act[2])
-    else:
-        f_albd(write_slot, K_C, act[1])
-
-
-def _weave_tick(weave, cursor, stride, ctx, fns, a_pipe, asc_pipe):
-    """Issue the next weave action if this mfma is on a `stride` boundary.
-
-    Module-level (not nested in the traced kernel) so the DSL AST rewriter,
-    which rebinds names assigned in the enclosing traced function, cannot break
-    it. cursor is [next_action, mfma_count], mutated in place.
-    """
-    if cursor[0] < len(weave) and (cursor[1] % stride) == 0:
-        _weave_run(weave[cursor[0]], ctx, fns, a_pipe, asc_pipe)
-        cursor[0] += 1
-    cursor[1] += 1
 
 
 def _udiv(a, c):
@@ -418,15 +335,15 @@ def _gemm1_body(
     N0_HALF = N_OUT // 32
     b_load_s_base = []
     for j in range_constexpr(4):
-        tile_il = n_block_idx * fx.Int32(16) + wave * fx.Int32(4) + fx.Int32(j)
-        g = tile_il & fx.Int32(1)
-        n0 = tile_il >> fx.Int32(1)
-        col = (g * fx.Int32(N0_HALF) + n0) * fx.Int32(16)
-        v = (e * fx.Int32(N_OUT) + col) * fx.Int32(K_HALF)
-        b_load_s_base.append(rocdl.readfirstlane(T.i32, v))
+        tile_il = n_block_idx * fx.Int32(16) + wave * fx.Int32(4) + fx.Int32(j) # 全局tile号 0..63
+        g = tile_il & fx.Int32(1) # gate or up
+        n0 = tile_il >> fx.Int32(1) # ith 16.
+        col = (g * fx.Int32(N0_HALF) + n0) * fx.Int32(16) # 定位到col
+        v = (e * fx.Int32(N_OUT) + col) * fx.Int32(K_HALF) # col 0, col 16.
+        b_load_s_base.append(rocdl.readfirstlane(T.i32, v)) # 每个wave 4个.
 
     # -- b_scale_s_base / _hi (HIP 418-429) -----------------------------------
-    np_gate = n_block_idx * fx.Int32(BN // 64) + wave
+    np_gate = n_block_idx * fx.Int32(BN // 64) + wave # n_bid * 4 + wave
     np_list = [np_gate, np_gate + fx.Int32(N_OUT // 64)]
     b_scale_s_base, b_scale_s_base_hi = [], []
     for mw in range_constexpr(2):
@@ -438,14 +355,13 @@ def _gemm1_body(
         b_scale_s_base_hi.append(base + fx.Int32(16 * kBS_stride_k0_dw * 4))
 
     accm = [[None] * 4 for _ in range(kMChunks)]
-    # B is triple-buffered when _BDEEP: with only 2 buffers the load that refills
-    # b[slot_b] targets the very buffer this iteration's mfma are still reading,
-    # so bld[j] may not be issued before the last mfma that reads B[j] (WAR).
-    # That pins all 8 B loads to fixed points in the schedule. With 3 buffers the
-    # load writes a slot nobody is reading, so it can go anywhere -- which is
-    # what lets the loads be spread evenly through the mfma stream.
-    # Cost is 32 VGPR (4 J x 2 halves x i32x4); the kernel uses 284 of 512.
-    kBStages = 3 if _BDEEP else kStages
+    # B is triple-buffered. With only 2 buffers the load that refills b[slot_b]
+    # targets the very buffer this iteration's mfma are still reading, so bld[j]
+    # could not be issued before the last mfma that reads B[j] (WAR) -- which
+    # pinned all 8 B loads to fixed points. With 3 buffers the load writes a
+    # slot nobody is reading and can go anywhere, which is what lets them be
+    # spread evenly through the mfma stream.
+    kBStages = 3
     b = [[[None, None] for _ in range(4)] for _ in range(kBStages)]
     b_scale_v = [[None, None] for _ in range(kStages)]
 
@@ -621,8 +537,8 @@ def _gemm1_body(
 
     def issue_b_load_one(b_slot, K_C, j, half):
         """One B buffer_load, for weaving individually into the mfma stream.
-        Only legal to place freely when B is triple-buffered (_BDEEP): with 2
-        buffers this write races the mfma still reading the same slot."""
+        Only legal to place freely because B is triple-buffered: with 2
+        buffers this write would race the mfma still reading the same slot."""
         v = (
             (lane_div_16 * fx.Int32(256))
             + (lane_mod_16 * fx.Int32(16))
@@ -702,31 +618,7 @@ def _gemm1_body(
     mfma_ty = T.f32x4
     zero4 = Vec.filled(4, 0.0, fx.Float32)
 
-    def mfma_cluster(
-        b_slot, a, a_scale, bs_slot, J, init, weave=None, stride=2, cursor=None,
-        wctx=None, wpipes=None,
-    ):
-        # `weave` is a list of zero-arg thunks (ds_read / buffer_load). One is
-        # issued every `stride` mfma so each load gets more than one mfma execute
-        # shadow to hide behind. fp4 mfma is ~6-cyc issue / 16-cyc execute, so a
-        # 5-cyc ds_read or 3-cyc buffer_load fits free in the gap -- 64 mfma give
-        # 64*(16-6) = 640 shadow cycles against only ~137 cycles of loads to
-        # issue. Bunching them (as a plain block of 19 ds_reads) wastes that.
-        # Mirrors fp4_gemm_4wave's MmaFp4._interleaved_cluster.
-        # `cursor` is [n, m] carried across the 4 quads of one iteration so the
-        # weave spreads over all 64 mfma instead of restarting each quad.
-        # _tick is the module-level helper, called with explicit arguments: the
-        # DSL AST rewriter rebinds names assigned in the enclosing traced
-        # function, so a nested def that reads mfma_cluster's locals breaks.
-        # No nested def for the tick, and no closures in the weave: the DSL AST
-        # rewriter breaks both (UnboundLocalError, or silently-lost default-arg
-        # bindings). The weave is a list of plain tuples executed inline below.
-        _wv = weave if weave is not None else []
-        _cur = cursor if cursor is not None else [0, 0]
-        _wctx = wctx if wctx is not None else (0, 0, 0, 0)
-        _wfns = (issue_a_ds_read_one, issue_a_scale_ds_read_one, issue_a_load_lds_one)
-        _wap = wpipes[0] if wpipes is not None else [None, []]
-        _wsp = wpipes[1] if wpipes is not None else [None, []]
+    def mfma_cluster(b_slot, a, a_scale, bs_slot, J, init):
 
         mni = J % 2
         in_b = J // 2
@@ -754,28 +646,22 @@ def _gemm1_body(
                     accm[i0][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
                         mfma_ty, [a[i0][0], bJ0, zero4, 4, 4, 0, sa, 0 + in_b, sb]
                     )
-                    _weave_tick(_wv, _cur, stride, _wctx, _wfns, _wap, _wsp)
                     accm[i1][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
                         mfma_ty, [a[i1][0], bJ0, zero4, 4, 4, 1, sa, 0 + in_b, sb]
                     )
-                    _weave_tick(_wv, _cur, stride, _wctx, _wfns, _wap, _wsp)
                 else:
                     accm[i0][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
                         mfma_ty, [a[i0][0], bJ0, accm[i0][J], 4, 4, 0, sa, 0 + in_b, sb]
                     )
-                    _weave_tick(_wv, _cur, stride, _wctx, _wfns, _wap, _wsp)
                     accm[i1][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
                         mfma_ty, [a[i1][0], bJ0, accm[i1][J], 4, 4, 1, sa, 0 + in_b, sb]
                     )
-                    _weave_tick(_wv, _cur, stride, _wctx, _wfns, _wap, _wsp)
                 accm[i0][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
                     mfma_ty, [a[i0][1], bJ1, accm[i0][J], 4, 4, 2, sa, 2 + in_b, sb]
                 )
-                _weave_tick(_wv, _cur, stride, _wctx, _wfns, _wap, _wsp)
                 accm[i1][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
                     mfma_ty, [a[i1][1], bJ1, accm[i1][J], 4, 4, 3, sa, 2 + in_b, sb]
                 )
-                _weave_tick(_wv, _cur, stride, _wctx, _wfns, _wap, _wsp)
 
     def mfma_iouter(b_slot, b_wr, a, a_scale, bs_slot, init, weave, ctx,
                     a_nxt, asc_nxt):
@@ -832,12 +718,10 @@ def _gemm1_body(
     # writes slot (OFFSET+1)%3 -- a different buffer.
     _adsrd = _ADSRD
     _bsc_x4 = _BSC_X4
-    _ilv = _ILV
-    _iout = _IOUT and _BDEEP
+    _iout = _IOUT
     _IOUT_CARRY, _IOUT_WEAVE, _IOUT_POST_ALBD = _build_iouter_plan(
         kMChunks, kSubBlocks
     )
-    _PRO, _TH = _build_thunk_plan(kMChunks, kSubBlocks)
     issue_a_scale_load()
     for K_C in range_constexpr(kStages):
         issue_a_load_lds(K_C, K_C)
@@ -862,7 +746,7 @@ def _gemm1_body(
     # publish slot 0, so it sits right after a full barrier here.
     a_pipe = [None, None]
     asc_pipe = [None, None]
-    if const_expr(_adsrd or _ilv or _iout):
+    if const_expr(_adsrd or _iout):
         gpu.barrier()
         asc_pipe[0] = issue_a_scale_ds_read(0)
         a_pipe[0] = issue_a_ds_read(0)
@@ -892,12 +776,12 @@ def _gemm1_body(
             # The fence must retire the previous iteration's albd, because the
             # barrier right after it is what publishes that A slot to the other
             # 3 waves. The count is "how many VMEM ops the weave issues AFTER
-            # the last albd": _adsrd/_ilv keep the original albd -> bld -> bsc
+            # the last albd": _adsrd keeps the original albd -> bld -> bsc
             # order (4 albd first, then 10), while _iout's plan puts the 4 albd
             # at mfma 5/9/13/17 followed by exactly 8 B loads.
             if const_expr(_iout):
                 _fv = _IOUT_POST_ALBD
-            elif const_expr(_adsrd or _ilv):
+            elif const_expr(_adsrd):
                 _fv = 10
             else:
                 _fv = _FENCE_VMCNT
@@ -907,10 +791,7 @@ def _gemm1_body(
             rocdl.s_barrier()
         else:
             gpu.barrier()
-        _weave = None
-        _wctx = (0, 0, 0, 0)
-        _wcur = [0, 0]
-        if const_expr(_ilv or _iout):
+        if const_expr(_iout):
             # A / A-scale for THIS iteration were prefetched by the previous one
             # (or by the prologue), so the mfma stream starts right after the
             # barrier with no ds_read block in front of it.
@@ -921,19 +802,9 @@ def _gemm1_body(
             # tail loop re-reads what it needs, so the clamped extra read is
             # harmless (idempotent, result never consumed).
             nxt_kt = min(K_C - kStages + 1, K_TILES_TOTAL - 1)
-            # The weave is a PLAN (list of tuples), not a list of closures: the
-            # DSL AST rewriter mangles lambdas that capture this function's
-            # locals -- their default-arg bindings are silently lost, so the
-            # thunks write into a stale list and the carry comes out empty.
-            # mfma_cluster executes each action inline instead.
+            # Destination for the fragments this iteration prefetches.
             _pipe_alloc(a_pipe, (kMChunks,))
             _pipe_alloc(asc_pipe, kSubBlocks)
-            # The next iteration's first-quad operands go LAST in the weave: they
-            # are the newest ds_reads, so putting them at the end of this
-            # iteration's mfma stream still leaves them a full barrier away from
-            # their use, while the earlier thunks get the deepest shadow.
-            _weave = _TH + _PRO
-            _wctx = (nxt_slot, nxt_kt, write_slot, K_C)
         elif const_expr(_adsrd):
             # issued at the tail of the previous iteration, inside its mfma shadow
             asc_cur = asc_pipe[0]
@@ -948,7 +819,7 @@ def _gemm1_body(
             bs_cur = read_b_scale(OFFSET)
         else:
             bs_cur = b_scale_v[slot_bsc]
-        if const_expr(not _ilv and not _iout):
+        if const_expr(not _iout):
             issue_a_load_lds(write_slot, K_C) # d2s
         if const_expr(_iout):
             # i-outer: all 64 mfma emitted together, every load woven in.
@@ -964,19 +835,10 @@ def _gemm1_body(
             )
         else:
           for J in range_constexpr(4):
-            # One shared weave cursor across all 4 quads: 24 thunks at stride 2
-            # need 48 of the 64 mfma, so they spread over the whole iteration
-            # rather than bunching into J=0.
-            mfma_cluster(
-                b[slot_b], a_cur, asc_cur, bs_cur, J, init=(OFFSET == 0),
-                weave=_weave, stride=_ILV_STRIDE, cursor=_wcur,
-                wctx=_wctx, wpipes=(a_pipe, asc_pipe),
-            )
-            if const_expr(not _ilv):
-                rocdl.sched_barrier(0)
+            mfma_cluster(b[slot_b], a_cur, asc_cur, bs_cur, J, init=(OFFSET == 0))
+            rocdl.sched_barrier(0)
             issue_b_load_j(b[write_b], K_C, J) # 2 * B128
-            if const_expr(not _ilv):
-                rocdl.sched_barrier(0)
+            rocdl.sched_barrier(0)
             if const_expr(_adsrd and J == 1):
                 # Next iteration's A/A-scale, issued mid-mfma so the LDS latency
                 # overlaps the remaining 32 mfma. Slot (OFFSET+1)%kAStages was
@@ -1001,22 +863,6 @@ def _gemm1_body(
                     issue_b_scale_gather(nxt_grp)
         else:
             issue_b_scale_load(b_scale_v[slot_bsc], K_C) # 2 * B32?
-        if const_expr(_ilv):
-            # Drain any thunk the 64 mfma did not reach, then rotate the carry:
-            # what this iteration prefetched becomes the next one's operands.
-            # The bounds are plain python ints (the weave plan is compile-time),
-            # so slice the list directly -- a `while`, or an `if` inside the
-            # loop, would be rewritten into scf and break on the list index.
-            for _t in _weave[_wcur[0]:]:
-                _weave_run(
-                    _t, _wctx,
-                    (issue_a_ds_read_one, issue_a_scale_ds_read_one,
-                     issue_a_load_lds_one),
-                    a_pipe, asc_pipe,
-                )
-            _wcur[0] = len(_weave)
-            _rotate_pipe(a_pipe)
-            _rotate_pipe(asc_pipe)
         if const_expr(_iout):
             # what this iteration prefetched becomes the next one's operands
             _rotate_pipe(a_pipe)
