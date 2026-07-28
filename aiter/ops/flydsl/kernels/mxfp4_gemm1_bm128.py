@@ -721,9 +721,12 @@ def _gemm1_body(
     # ahead of its first mfma. Needs a full barrier first to publish slot 0.
     a_pipe = [None, None]
     asc_pipe = [None, None]
+    bsc_pipe = [None, None]
     gpu.barrier()
     asc_pipe[0] = issue_a_scale_ds_read(0)
     a_pipe[0] = issue_a_ds_read(0)
+    if const_expr(_bsc_x4):
+        bsc_pipe[0] = read_b_scale(0)
 
     for OFFSET in range_constexpr(kUnroll): #  28 主循环.
         K_C = kStages + OFFSET # 2 + i
@@ -754,10 +757,11 @@ def _gemm1_body(
         a_cur = a_pipe[0]
         asc_cur = asc_pipe[0]
         if const_expr(_bsc_x4):
-            # tile OFFSET's scales, gathered ~4 iterations ago (>=48 VMEM ops), so
-            # the vmcnt fence above has long retired that dwordx4. Each wave owns
-            # its own LDS region here, so no cross-wave barrier is needed.
-            bs_cur = read_b_scale(OFFSET) # TODO(zty) 提前这个到上一轮去读，类似 asc_cur?
+            # Read out of LDS by the previous iteration's weave, like the A
+            # fragments -- so no ds_read sits between the barrier and the first
+            # mfma. Each wave owns its own region of s_bsc, so there is no
+            # cross-wave ordering to respect here.
+            bs_cur = bsc_pipe[0]
         else:
             bs_cur = b_scale_v[slot_bsc]
         _pipe_alloc(a_pipe, (kMChunks,)) # TODO(zty) 后面简化吧.
@@ -793,6 +797,8 @@ def _gemm1_body(
                 issue_a_ds_read_one, a_nxt,
                 ((0, 0), (nxt_slot, 0, 0)), ((0, 1), (nxt_slot, 0, 1)),
             )
+            + (_store_thunks(read_b_scale, bsc_pipe, (1, (OFFSET + 1,)))
+               if _bsc_x4 else [])
             + _thunks(issue_b_load_one,
                       *[(b[write_b], K_C, j, h)
                         for h in range(2) for j in range(4)])
@@ -818,6 +824,8 @@ def _gemm1_body(
         # what this iteration prefetched becomes the next one's operands
         _rotate_pipe(a_pipe)
         _rotate_pipe(asc_pipe)
+        if const_expr(_bsc_x4):
+            _rotate_pipe(bsc_pipe)
 
     for S in range_constexpr(kStages):
         kt = K_TILES_TOTAL - kStages + S
