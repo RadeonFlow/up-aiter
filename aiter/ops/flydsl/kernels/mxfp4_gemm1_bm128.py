@@ -58,9 +58,11 @@ _ASM_ALBD = False
 # of one tile, a stride-256 pattern no single VMEM op can express. Same idiom
 # as fp4_gemm_4wave's ScaleLoaderLDS.
 #
-# NOTE this is currently SLOWER (3549 vs 3794 TFLOP/s) -- the gather and its
-# ds_read are still placed the way the old J-outer schedule wanted them. Set
-# False for the faster configuration.
+# It was 6.5% SLOWER while the gather and its ds_read were still placed the way
+# the old J-outer schedule wanted them -- the gather exposed after all 64 mfma,
+# the read sitting between the barrier and the first mfma. With both woven into
+# the mfma stream it is now +0.8% (3481 vs 3452 TFLOP/s, three interleaved A/B
+# pairs, deltas 28.7 / 29.0 / 29.5 -- small but very repeatable).
 _BSC_X4 = True
 
 # Geometry of the B-scale LDS transpose region, used only when _BSC_X4.
