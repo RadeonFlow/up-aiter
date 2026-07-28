@@ -80,87 +80,61 @@ def _mfma_weave_order(kMChunks, kSubBlocks):
     return out
 
 
-def _iouter_run(act, nxt_slot, nxt_kt, write_slot, K_C, b_slot, a_nxt, asc_nxt,
-                f_a, f_asc, f_albd, f_bld):
-    """Execute one weave action. Module-level with everything passed explicitly:
-    the DSL AST rewriter mangles closures over a traced function's locals (their
-    captures silently come back empty)."""
-    kind = act[0]
-    if kind == "a":
-        a_nxt[act[1]][act[2]] = f_a(nxt_slot, act[1], act[2])
-    elif kind == "asc":
-        asc_nxt[act[1]] = f_asc(nxt_kt, act[1])
-    elif kind == "albd":
-        f_albd(write_slot, K_C, act[1])
-    elif kind == "bld":
-        f_bld(b_slot, K_C, act[1], act[2])
+def _a_read_order(kMChunks, kSubBlocks):
+    """(kind, *idx) for the A / A-scale ds_reads of one iteration, in deadline
+    order.
 
-
-def _build_iouter_plan(kMChunks, kSubBlocks):
-    """Schedule for the i-outer mfma order: for k(2): for i(8): for J(4).
-
-    See resource_inspect/gen_gemm1_iouter_schedule.py, which emits the same plan
-    as a readable listing next to the fp4_gemm_4wave reference.
-
-    The order change is what makes weaving possible. With J outermost (the
-    original), J=0's 16 mfma already touch all 8 M-blocks, so every A ds_read
-    must land before the first mfma -- that is the ~300-cycle dead head we
-    measured. With i outermost, A[i,k] is reused by 4 consecutive mfma, so
-    A[i+1,k] only has to arrive 4 mfma later and hides in A[i]'s shadow.
-    It also stretches the same accumulator's reuse distance from 8 mfma to 32.
-
-    Returns (carry, weave):
-      carry -- issued at the END of the previous iteration: what the first mfma
-               needs (A[0,0] A[0,1] Asc[0]).
-      weave -- [(mfma_index, action)] for this iteration, action being
-               ("a",i,k) / ("asc",sub) / ("albd",sub) / ("bld",j,half).
-               Every entry is placed before its first consumer, and no two VMEM
-               ops land within 2 mfma of each other (back-to-back buffer_loads
-               queue on L1 and their issue latency blows up).
+    The mfma run k-outer, i, then J, so A[i,k] is first consumed at mfma
+    k*32 + i*4, and A-scale[s] at the first i it covers, i = 2s. Sorting by
+    that interleaves the two streams -- asc[1] lands between A[2,0] and A[3,0],
+    not after all sixteen A fragments. A[0,*] and asc[0] are excluded: they are
+    the next iteration's first operands and go last, so they are the freshest.
     """
-    order = [(k, i, j) for k in range(2) for i in range(kMChunks) for j in range(4)]
-    first_a = {}
-    for n, (k, i, _j) in enumerate(order):
-        first_a.setdefault((i, k), n)
+    out = [(i * 4 + k * 32, ("a", i, k))
+           for k in range(2) for i in range(1, kMChunks)]
+    out += [(2 * s * 4, ("asc", s)) for s in range(1, kSubBlocks)]
+    out.sort(key=lambda x: x[0])
+    return [a for _, a in out]
 
-    carry = [("asc", 0), ("a", 0, 0), ("a", 0, 1)]
 
-    # ds_read queue, ordered by deadline; A[0,*] and Asc[0] come in on the carry.
-    todo = [(first_a[(i, k)], ("a", i, k)) for k in range(2) for i in range(1, kMChunks)]
-    todo += [(first_a[(2 * s, 0)], ("asc", s)) for s in range(1, kSubBlocks)]
-    # next iteration's carry, re-read at the end so it is freshest
-    todo += [(len(order), a) for a in carry]
-    todo.sort(key=lambda x: x[0])
+def _a_read_thunks(order, a_nxt, asc_nxt, slot, kt, f_a, f_asc):
+    """Turn _a_read_order's list into thunks that store into the two holders."""
+    out = []
+    for act in order:
+        if act[0] == "a":
+            out += _store_thunks(f_a, a_nxt,
+                                 ((act[1], act[2]), (slot, act[1], act[2])))
+        else:
+            out += _store_thunks(f_asc, asc_nxt, (act[1], (kt, act[1])))
+    return out
 
-    # VMEM: 4 albd (no deadline this iteration -- the NEXT barrier publishes the
-    # slot) + 8 B loads (free to move only because B is triple-buffered).
-    vmem = [("albd", s) for s in range(kSubBlocks)]
-    vmem += [("bld", j, h) for h in range(2) for j in range(4)]
-    step = len(order) // (len(vmem) + 1)
-    vmem_at = {1 + step * (n + 1): v for n, v in enumerate(vmem)}
 
-    weave = []
-    ti = 0
-    for n in range(len(order)):
-        if n in vmem_at:
-            weave.append((n, vmem_at[n]))
-            continue
-        if ti < len(todo):
-            deadline, act = todo[ti]
-            if n < deadline:
-                weave.append((n, act))
-                ti += 1
-    for _, act in todo[ti:]:
-        weave.append((len(order) - 1, act))
+def _thunks(fn, *arglists):
+    """Bind fn to each argument tuple, as a list of zero-arg thunks.
 
-    # VMEM ops issued after the LAST albd. The steady fence must use exactly
-    # this count so it retires all 4 albd (the barrier that follows publishes
-    # that A slot to the other 3 waves) without draining anything else.
-    vm_seq = [a for _, a in weave if a[0] in ("albd", "bld")]
-    post_albd = len(vm_seq) - 1 - max(
-        i for i, a in enumerate(vm_seq) if a[0] == "albd"
-    )
-    return carry, weave, post_albd
+    Module level on purpose: a lambda defined inside a traced kernel loses its
+    captures to the DSL AST rewriter (they silently come back empty), so the
+    binding has to happen out here. Same reason fp4_gemm_4wave keeps its
+    _g2s_thunks / _s2r_thunks at module scope.
+    """
+    return [(lambda f=fn, a=args: f(*a)) for args in arglists]
+
+
+def _store_thunks(fn, holder, *specs):
+    """Like _thunks, but each thunk stores fn's result into the holder.
+
+    A spec is (dst, args): dst is an index or an (i, j) pair into holder, and
+    args is the tuple passed to fn.
+    """
+    out = []
+    for dst, args in specs:
+        def _one(f=fn, h=holder, d=dst, a=args):
+            if isinstance(d, tuple):
+                h[d[0]][d[1]] = f(*a)
+            else:
+                h[d] = f(*a)
+        out.append(_one)
+    return out
 
 
 def _pipe_alloc(pipe, shape):
@@ -515,10 +489,6 @@ def _gemm1_body(
             out.append(llvm.load(T.i32, _gep3(base_ptr, lds_dw * fx.Int32(4))))
         return out
 
-    lib = lane & fx.Int32(3)
-    lane_shr2_and3 = (lane >> fx.Int32(2)) & fx.Int32(3)
-    r_in_chunk = wave * fx.Int32(4) + lane_div_16
-
     def issue_b_load_j(b_slot, K_C, j):
         v = (
             (lane_div_16 * fx.Int32(256))
@@ -663,20 +633,17 @@ def _gemm1_body(
                     mfma_ty, [a[i1][1], bJ1, accm[i1][J], 4, 4, 3, sa, 2 + in_b, sb]
                 )
 
-    def mfma_iouter(b_slot, b_wr, a, a_scale, bs_slot, init, weave, ctx,
-                    a_nxt, asc_nxt):
-        """Emit all 64 mfma in i-outer order (k, i, J) with `weave` woven in.
+    def mfma_iouter(b_slot, a, a_scale, bs_slot, init, interleave, stride):
+        """Emit all 64 mfma in i-outer order (k, i, J), issuing one thunk from
+        `interleave` every `stride` mfma.
 
-        Original order is J outermost, which gives A zero reuse inside a quad and
-        forces all 19 ds_reads to complete before the first mfma. Here A[i,k] is
-        shared by 4 consecutive mfma (one per J), so the next A can be read in
-        their shadow, and the same accumulator is revisited every 32 mfma instead
-        of every 8.
+        i-outer is what makes the weave possible: A[i,k] is shared by the 4
+        consecutive mfma of one (k,i), so the ds_read of the next fragment only
+        has to land 4 mfma later. With J outermost, J=0's 16 mfma already touch
+        all 8 M-blocks and every A ds_read has to complete before the first
+        mfma. It also stretches one accumulator's reuse from 8 mfma to 32.
         """
-        nxt_slot, nxt_kt, write_slot, K_C = ctx
-        at = {}
-        for n, act in weave:
-            at.setdefault(n, []).append(act)
+        nth = 0
         n = 0
         for k in range_constexpr(2):
             for i in range_constexpr(kMChunks):
@@ -698,14 +665,15 @@ def _gemm1_body(
                         mfma_ty,
                         [a_ik, b_slot[J][k], src, 4, 4, osa, sa, osb, bs_slot[J % 2]],
                     )
-                    for act in at.get(n, ()):
-                        _iouter_run(
-                            act, nxt_slot, nxt_kt, write_slot, K_C, b_wr,
-                            a_nxt, asc_nxt,
-                            issue_a_ds_read_one, issue_a_scale_ds_read_one,
-                            issue_a_load_lds_one, issue_b_load_one,
-                        )
+                    if nth < len(interleave) and (n % stride) == 0:
+                        interleave[nth]()
+                        nth += 1
                     n += 1
+        # Drain whatever the 64 mfma did not reach. A `while` here would be
+        # rewritten into scf.while by the DSL tracer; the bounds are plain
+        # python ints, so slice instead.
+        for _t in interleave[nth:]:
+            _t()
 
     _relax_prologue = True
     # ADSRD: rotate the A / A-scale ds_reads one iteration EARLIER, so they issue
@@ -719,9 +687,20 @@ def _gemm1_body(
     _adsrd = _ADSRD
     _bsc_x4 = _BSC_X4
     _iout = _IOUT
-    _IOUT_CARRY, _IOUT_WEAVE, _IOUT_POST_ALBD = _build_iouter_plan(
-        kMChunks, kSubBlocks
-    )
+    # One thunk every _IOUT_STRIDE mfma. 32 thunks over 64 mfma -> stride 2
+    # spreads them across the first 25 mfma and leaves the rest a clean mfma
+    # run; it also keeps any two VMEM ops at least 4 mfma apart, which matters
+    # because back-to-back buffer_loads queue on L1 and their issue latency
+    # blows up.
+    _A_READ_ORDER = _a_read_order(kMChunks, kSubBlocks)
+    _IOUT_STRIDE = 2
+    # Steady fence. The schedule above issues 4 albd and then 8 B loads, and
+    # vmcnt(N) retires oldest-first, so waiting for <= 8 in flight retires
+    # exactly the 4 albd -- which is what the barrier below needs, because
+    # right after it the other 3 waves start ds_read-ing that A tile. It is the
+    # loosest legal value: 12 VMEM are in flight, and vmcnt(9) or looser leaves
+    # an albd unlanded. See resource_inspect/gemm1_fence_explained.txt.
+    _IOUT_POST_ALBD = 2 * 4  # the 8 B loads that follow the last albd
     issue_a_scale_load()
     for K_C in range_constexpr(kStages):
         issue_a_load_lds(K_C, K_C)
@@ -797,14 +776,6 @@ def _gemm1_body(
             # barrier with no ds_read block in front of it.
             a_cur = a_pipe[0]
             asc_cur = asc_pipe[0]
-            nxt_slot = (OFFSET + 1) % kAStages
-            # Clamp: the final iteration would prefetch tile K_TILES_TOTAL. The
-            # tail loop re-reads what it needs, so the clamped extra read is
-            # harmless (idempotent, result never consumed).
-            nxt_kt = min(K_C - kStages + 1, K_TILES_TOTAL - 1)
-            # Destination for the fragments this iteration prefetches.
-            _pipe_alloc(a_pipe, (kMChunks,))
-            _pipe_alloc(asc_pipe, kSubBlocks)
         elif const_expr(_adsrd):
             # issued at the tail of the previous iteration, inside its mfma shadow
             asc_cur = asc_pipe[0]
@@ -822,16 +793,46 @@ def _gemm1_body(
         if const_expr(not _iout):
             issue_a_load_lds(write_slot, K_C) # d2s
         if const_expr(_iout):
-            # i-outer: all 64 mfma emitted together, every load woven in.
             _pipe_alloc(a_pipe, (kMChunks,))
             _pipe_alloc(asc_pipe, kSubBlocks)
+            a_nxt, asc_nxt = a_pipe[1], asc_pipe[1]
+            nxt_slot = (OFFSET + 1) % kAStages
+            # Clamp: the last iteration would prefetch tile K_TILES_TOTAL. The
+            # drain re-reads what it needs, so the extra read is idempotent.
+            nxt_kt = min(K_C - kStages + 1, K_TILES_TOTAL - 1)
+
+            # The schedule for this iteration's 64 mfma, in issue order. One
+            # thunk goes out every _IOUT_STRIDE mfma.
+            #
+            #   A1  the next iteration's A fragments and A-scale (LDS -> reg)
+            #   A2  this iteration's A refill        (global -> LDS, async DMA)
+            #   B2  the B fragments two iterations out    (global -> VGPR)
+            #
+            # Order matters twice over. The A1 reads come first because they are
+            # the ones with a deadline (the next iteration's first mfma), and
+            # the 4 albd sit ahead of all 8 B loads because the steady fence has
+            # to cover them -- vmcnt counts ops, oldest first, so the fence
+            # value is exactly the number of VMEM ops issued after the last
+            # albd. Putting the B loads first would drive it to vmcnt(0).
+            il = (
+                _a_read_thunks(_A_READ_ORDER, a_nxt, asc_nxt, nxt_slot, nxt_kt,
+                               issue_a_ds_read_one, issue_a_scale_ds_read_one)
+                + _thunks(issue_a_load_lds_one,
+                          *[(write_slot, K_C, s) for s in range(kSubBlocks)])
+                + _store_thunks(
+                    issue_a_scale_ds_read_one, asc_nxt, (0, (nxt_kt, 0)),
+                )
+                + _store_thunks(
+                    issue_a_ds_read_one, a_nxt,
+                    ((0, 0), (nxt_slot, 0, 0)), ((0, 1), (nxt_slot, 0, 1)),
+                )
+                + _thunks(issue_b_load_one,
+                          *[(b[write_b], K_C, j, h)
+                            for h in range(2) for j in range(4)])
+            )
             mfma_iouter(
-                b[slot_b], b[write_b], a_cur, asc_cur, bs_cur,
-                (OFFSET == 0), _IOUT_WEAVE,
-                ((OFFSET + 1) % kAStages,
-                 min(K_C - kStages + 1, K_TILES_TOTAL - 1),
-                 write_slot, K_C),
-                a_pipe[1], asc_pipe[1],
+                b[slot_b], a_cur, asc_cur, bs_cur, (OFFSET == 0),
+                il, _IOUT_STRIDE,
             )
         else:
           for J in range_constexpr(4):
