@@ -750,10 +750,10 @@ def _gemm1_body(
             # tile OFFSET's scales, gathered ~4 iterations ago (>=48 VMEM ops), so
             # the vmcnt fence above has long retired that dwordx4. Each wave owns
             # its own LDS region here, so no cross-wave barrier is needed.
-            bs_cur = read_b_scale(OFFSET)
+            bs_cur = read_b_scale(OFFSET) # TODO(zty) 提前这个到上一轮去读，类似 asc_cur?
         else:
             bs_cur = b_scale_v[slot_bsc]
-        _pipe_alloc(a_pipe, (kMChunks,))
+        _pipe_alloc(a_pipe, (kMChunks,)) # TODO(zty) 后面简化吧.
         _pipe_alloc(asc_pipe, kSubBlocks)
         a_nxt, asc_nxt = a_pipe[1], asc_pipe[1]
         nxt_slot = (OFFSET + 1) % kAStages
