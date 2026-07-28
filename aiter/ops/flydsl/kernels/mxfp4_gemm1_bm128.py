@@ -46,8 +46,6 @@ from .mxfp4_gemm_common import (
 # Experiment knobs (env-driven so a sweep never needs a source edit; every run
 # must still use a cold FlyDSL cache -- see /dev/shm/nocache.py).
 _ASM_ALBD = False
-_FENCE_VMCNT = 14
-_ADSRD = False
 
 # B-scale wide load. The preshuffled B-scale for one n0 unit (32 N rows) is
 # CONTIGUOUS along K: K-tile t sits at byte t*256 within the unit. So one
@@ -62,7 +60,6 @@ _BSC_X4 = True
 # i-outer mfma order (for k: for i: for J) with every load woven in.
 # Requires the B triple-buffer: the B loads can only move once a load no
 # longer targets the buffer the mfma are reading.
-_IOUT = True
 _BSC_TILES = 4  # K-tiles covered by one dwordx4 gather (1024 B / 256 B)
 _BSC_SLOTS = 2  # double buffer over groups of _BSC_TILES
 _BSC_WAVE_BYTES = 2 * _BSC_TILES * 256  # 2 mw x 4 tiles x 256 B = 2 KB
@@ -684,9 +681,7 @@ def _gemm1_body(
     # the albd of iter OFFSET-2 and published by the barrier at the top of OFFSET-1.
     # So iter OFFSET-1 may already read it, and the concurrent albd of OFFSET-1
     # writes slot (OFFSET+1)%3 -- a different buffer.
-    _adsrd = _ADSRD
     _bsc_x4 = _BSC_X4
-    _iout = _IOUT
     # One thunk every _IOUT_STRIDE mfma. 32 thunks over 64 mfma -> stride 2
     # spreads them across the first 25 mfma and leaves the rest a clean mfma
     # run; it also keeps any two VMEM ops at least 4 mfma apart, which matters
@@ -725,7 +720,7 @@ def _gemm1_body(
     # publish slot 0, so it sits right after a full barrier here.
     a_pipe = [None, None]
     asc_pipe = [None, None]
-    if const_expr(_adsrd or _iout):
+    if True:
         gpu.barrier()
         asc_pipe[0] = issue_a_scale_ds_read(0)
         a_pipe[0] = issue_a_ds_read(0)
@@ -743,46 +738,21 @@ def _gemm1_body(
         # no WAR against this iteration's mfma and can be issued anywhere.
         write_b = K_C % kBStages
         # Steady fence: A read from read_slot was written by iter OFFSET-2
-        # (already landed), so barrier need NOT wait on this iter's 14 in-flight
-        # VMEM. Compiler can't see the double-buffer -> drains to vmcnt(10);
-        # relax to vmcnt(14) (don't gate VMEM). s_barrier keeps 4-wave sync.
-        if True:
-            # ADSRD needs the PREVIOUS iteration's 4 albd drained *before* the
-            # barrier, so the barrier publishes slot (OFFSET+1)%3 to all 4 waves
-            # and this iteration's tail ds_read of that slot is safe. In flight at
-            # this point = iter OFFSET-1's 14 VMEM issued albd(4) -> bld(8) ->
-            # bsc(2), so vmcnt(10) retires exactly the 4 oldest = the albd.
-            # The fence must retire the previous iteration's albd, because the
-            # barrier right after it is what publishes that A slot to the other
-            # 3 waves. The count is "how many VMEM ops the weave issues AFTER
-            # the last albd": _adsrd keeps the original albd -> bld -> bsc
-            # order (4 albd first, then 10), while _iout's plan puts the 4 albd
-            # at mfma 5/9/13/17 followed by exactly 8 B loads.
-            if const_expr(_iout):
-                _fv = _IOUT_POST_ALBD
-            elif const_expr(_adsrd):
-                _fv = 10
-            else:
-                _fv = _FENCE_VMCNT
-            llvm.InlineAsmOp(
-                None, [], f"s_waitcnt vmcnt({_fv})", "", has_side_effects=True
-            )
-            rocdl.s_barrier()
-        else:
-            gpu.barrier()
-        if const_expr(_iout):
-            # A / A-scale for THIS iteration were prefetched by the previous one
-            # (or by the prologue), so the mfma stream starts right after the
-            # barrier with no ds_read block in front of it.
-            a_cur = a_pipe[0]
-            asc_cur = asc_pipe[0]
-        elif const_expr(_adsrd):
-            # issued at the tail of the previous iteration, inside its mfma shadow
-            asc_cur = asc_pipe[0]
-            a_cur = a_pipe[0]
-        else:
-            asc_cur = issue_a_scale_ds_read(K_C - kStages)
-            a_cur = issue_a_ds_read(read_slot)
+        # The fence must retire the previous iteration's albd: the barrier right
+        # after it is what publishes that A slot to the other 3 waves. vmcnt
+        # counts ops and retires oldest-first, and the schedule issues the 4
+        # albd ahead of all 8 B loads, so waiting for <= 8 in flight retires
+        # exactly the albd. A bare s_barrier would not do -- it synchronises
+        # program position and does not drain VMEM at all.
+        llvm.InlineAsmOp(
+            None, [], f"s_waitcnt vmcnt({_IOUT_POST_ALBD})", "", has_side_effects=True
+        )
+        rocdl.s_barrier()
+        # A / A-scale for this iteration were prefetched by the previous one
+        # (or by the prologue), so the mfma stream starts right after the
+        # barrier with no ds_read block in front of it.
+        a_cur = a_pipe[0]
+        asc_cur = asc_pipe[0]
         if const_expr(_bsc_x4):
             # tile OFFSET's scales, gathered ~4 iterations ago (>=48 VMEM ops), so
             # the vmcnt fence above has long retired that dwordx4. Each wave owns
@@ -790,65 +760,47 @@ def _gemm1_body(
             bs_cur = read_b_scale(OFFSET)
         else:
             bs_cur = b_scale_v[slot_bsc]
-        if const_expr(not _iout):
-            issue_a_load_lds(write_slot, K_C) # d2s
-        if const_expr(_iout):
-            _pipe_alloc(a_pipe, (kMChunks,))
-            _pipe_alloc(asc_pipe, kSubBlocks)
-            a_nxt, asc_nxt = a_pipe[1], asc_pipe[1]
-            nxt_slot = (OFFSET + 1) % kAStages
-            # Clamp: the last iteration would prefetch tile K_TILES_TOTAL. The
-            # drain re-reads what it needs, so the extra read is idempotent.
-            nxt_kt = min(K_C - kStages + 1, K_TILES_TOTAL - 1)
+        _pipe_alloc(a_pipe, (kMChunks,))
+        _pipe_alloc(asc_pipe, kSubBlocks)
+        a_nxt, asc_nxt = a_pipe[1], asc_pipe[1]
+        nxt_slot = (OFFSET + 1) % kAStages
+        # Clamp: the last iteration would prefetch tile K_TILES_TOTAL. The
+        # drain re-reads what it needs, so the extra read is idempotent.
+        nxt_kt = min(K_C - kStages + 1, K_TILES_TOTAL - 1)
 
-            # The schedule for this iteration's 64 mfma, in issue order. One
-            # thunk goes out every _IOUT_STRIDE mfma.
-            #
-            #   A1  the next iteration's A fragments and A-scale (LDS -> reg)
-            #   A2  this iteration's A refill        (global -> LDS, async DMA)
-            #   B2  the B fragments two iterations out    (global -> VGPR)
-            #
-            # Order matters twice over. The A1 reads come first because they are
-            # the ones with a deadline (the next iteration's first mfma), and
-            # the 4 albd sit ahead of all 8 B loads because the steady fence has
-            # to cover them -- vmcnt counts ops, oldest first, so the fence
-            # value is exactly the number of VMEM ops issued after the last
-            # albd. Putting the B loads first would drive it to vmcnt(0).
-            il = (
-                _a_read_thunks(_A_READ_ORDER, a_nxt, asc_nxt, nxt_slot, nxt_kt,
-                               issue_a_ds_read_one, issue_a_scale_ds_read_one)
-                + _thunks(issue_a_load_lds_one,
-                          *[(write_slot, K_C, s) for s in range(kSubBlocks)])
-                + _store_thunks(
-                    issue_a_scale_ds_read_one, asc_nxt, (0, (nxt_kt, 0)),
-                )
-                + _store_thunks(
-                    issue_a_ds_read_one, a_nxt,
-                    ((0, 0), (nxt_slot, 0, 0)), ((0, 1), (nxt_slot, 0, 1)),
-                )
-                + _thunks(issue_b_load_one,
-                          *[(b[write_b], K_C, j, h)
-                            for h in range(2) for j in range(4)])
+        # The schedule for this iteration's 64 mfma, in issue order. One
+        # thunk goes out every _IOUT_STRIDE mfma.
+        #
+        #   A1  the next iteration's A fragments and A-scale (LDS -> reg)
+        #   A2  this iteration's A refill        (global -> LDS, async DMA)
+        #   B2  the B fragments two iterations out    (global -> VGPR)
+        #
+        # Order matters twice over. The A1 reads come first because they are
+        # the ones with a deadline (the next iteration's first mfma), and
+        # the 4 albd sit ahead of all 8 B loads because the steady fence has
+        # to cover them -- vmcnt counts ops, oldest first, so the fence
+        # value is exactly the number of VMEM ops issued after the last
+        # albd. Putting the B loads first would drive it to vmcnt(0).
+        il = (
+            _a_read_thunks(_A_READ_ORDER, a_nxt, asc_nxt, nxt_slot, nxt_kt,
+                           issue_a_ds_read_one, issue_a_scale_ds_read_one)
+            + _thunks(issue_a_load_lds_one,
+                      *[(write_slot, K_C, s) for s in range(kSubBlocks)])
+            + _store_thunks(
+                issue_a_scale_ds_read_one, asc_nxt, (0, (nxt_kt, 0)),
             )
-            mfma_iouter(
-                b[slot_b], a_cur, asc_cur, bs_cur, (OFFSET == 0),
-                il, _IOUT_STRIDE,
+            + _store_thunks(
+                issue_a_ds_read_one, a_nxt,
+                ((0, 0), (nxt_slot, 0, 0)), ((0, 1), (nxt_slot, 0, 1)),
             )
-        else:
-          for J in range_constexpr(4):
-            mfma_cluster(b[slot_b], a_cur, asc_cur, bs_cur, J, init=(OFFSET == 0))
-            rocdl.sched_barrier(0)
-            issue_b_load_j(b[write_b], K_C, J) # 2 * B128
-            rocdl.sched_barrier(0)
-            if const_expr(_adsrd and J == 1):
-                # Next iteration's A/A-scale, issued mid-mfma so the LDS latency
-                # overlaps the remaining 32 mfma. Slot (OFFSET+1)%kAStages was
-                # filled by iter OFFSET-1's albd and published by this iteration's
-                # top barrier; the albd running now targets a different slot.
-                nxt = (OFFSET + 1) % kAStages
-                asc_pipe[0] = issue_a_scale_ds_read(K_C - kStages + 1)
-                a_pipe[0] = issue_a_ds_read(nxt)
-                rocdl.sched_barrier(0)
+            + _thunks(issue_b_load_one,
+                      *[(b[write_b], K_C, j, h)
+                        for h in range(2) for j in range(4)])
+        )
+        mfma_iouter(
+            b[slot_b], a_cur, asc_cur, bs_cur, (OFFSET == 0),
+            il, _IOUT_STRIDE,
+        )
         if const_expr(_bsc_x4):
             # One gather every _BSC_TILES iterations instead of 2 loads every
             # iteration. Issue it on the FIRST iteration of the current group, so
@@ -864,10 +816,9 @@ def _gemm1_body(
                     issue_b_scale_gather(nxt_grp)
         else:
             issue_b_scale_load(b_scale_v[slot_bsc], K_C) # 2 * B32?
-        if const_expr(_iout):
-            # what this iteration prefetched becomes the next one's operands
-            _rotate_pipe(a_pipe)
-            _rotate_pipe(asc_pipe)
+        # what this iteration prefetched becomes the next one's operands
+        _rotate_pipe(a_pipe)
+        _rotate_pipe(asc_pipe)
 
     for S in range_constexpr(kStages):
         kt = K_TILES_TOTAL - kStages + S
