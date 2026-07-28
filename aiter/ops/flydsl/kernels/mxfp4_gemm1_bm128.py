@@ -133,22 +133,14 @@ def _store_thunks(fn, holder, *specs):
     return out
 
 
-def _pipe_alloc(pipe, shape):
-    """pipe[1] <- a fresh empty holder (shape = kMChunks for A, else a count).
-
-    Any `pipe[1] = ...` written inside `if const_expr(...)` in a traced kernel
-    is dropped by the DSL AST rewriter, which treats names assigned in a
-    control-flow body as captured closure variables. Doing the store from a
-    module-level function keeps it out of the rewriter's way.
-    """
-    if isinstance(shape, tuple):
-        pipe[1] = [[None, None] for _ in range(shape[0])]
-    else:
-        pipe[1] = [None] * shape
-
-
 def _rotate_pipe(pipe):
-    """pipe[0] <- pipe[1] (in place). Same rewriter caveat as _pipe_alloc."""
+    """pipe[0] <- pipe[1], in place.
+
+    Needed only where the rotate sits inside `if const_expr(...)`: the DSL AST
+    rewriter treats a name assigned in a control-flow body as a captured
+    closure variable and drops the store. Outside such a branch a plain
+    assignment is fine.
+    """
     pipe[0] = pipe[1]
 
 
@@ -769,9 +761,9 @@ def _gemm1_body(
             bs_cur = bsc_pipe[0]
         else:
             bs_cur = b_scale_v[slot_bsc]
-        _pipe_alloc(a_pipe, (kMChunks,)) # TODO(zty) 后面简化吧.
-        _pipe_alloc(asc_pipe, kSubBlocks)
-        a_nxt, asc_nxt = a_pipe[1], asc_pipe[1]
+        a_nxt = [[None, None] for _ in range(kMChunks)]
+        asc_nxt = [None] * kSubBlocks
+        a_pipe[1], asc_pipe[1] = a_nxt, asc_nxt
         nxt_slot = (OFFSET + 1) % kAStages
         # Clamp: the last iteration would prefetch tile K_TILES_TOTAL. The
         # drain re-reads what it needs, so the extra read is idempotent.
@@ -827,8 +819,7 @@ def _gemm1_body(
         if const_expr(not _bsc_x4):
             issue_b_scale_load(b_scale_v[slot_bsc], K_C)
         # what this iteration prefetched becomes the next one's operands
-        _rotate_pipe(a_pipe)
-        _rotate_pipe(asc_pipe)
+        a_pipe[0], asc_pipe[0] = a_pipe[1], asc_pipe[1]
         if const_expr(_bsc_x4):
             _rotate_pipe(bsc_pipe)
 
