@@ -683,7 +683,14 @@ def _gemm1_body(
     # 4 albd. That is what the barrier needs, because right after it the other
     # 3 waves start ds_read-ing that A tile. It is also the loosest legal
     # value: only 12 VMEM are ever in flight, so vmcnt(9) or looser leaves an
-    # albd unlanded. See resource_inspect/gemm1_fence_explained.txt.
+    # albd unlanded -- swept, and cosine degrades monotonically from vmcnt(9)
+    # on (0.0133, 0.0239, 0.0561, 0.1043 for 9..12).
+    #
+    # Note this is NOT the same budget as the compiler's own vmcnt(12)/(11)/(10)
+    # guarding the B operands. Those cover a bld issued two iterations before
+    # its use, so they get a full iteration of slack. The albd sit at the FRONT
+    # of the 12, so their slack is only what follows them. Same counter, two
+    # different distances. See resource_inspect/gemm1_fence_explained.txt.
     _IOUT_POST_ALBD = 2 * 4  # the 8 B loads that follow the last albd
 
     # ---- prologue ---------------------------------------------------------
