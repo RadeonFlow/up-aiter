@@ -65,6 +65,9 @@ _BSC_DBG = __import__("os").environ.get("GEMM1_BSC_DBG", "0") == "1"
 # mfma, issue only what the first quad needs and weave the rest one per
 # _ILV_STRIDE mfma, so each load hides in an mfma execute shadow.
 _BDEEP = __import__("os").environ.get("GEMM1_BDEEP", "0") == "1"
+# i-outer mfma order (for k: for i: for J) with every load woven in.
+# Requires _BDEEP: the B loads can only move once B is triple-buffered.
+_IOUT = __import__("os").environ.get("GEMM1_IOUT", "0") == "1"
 _ILV = __import__("os").environ.get("GEMM1_ILV", "0") == "1"
 _ILV_STRIDE = int(__import__("os").environ.get("GEMM1_ILV_STRIDE", "2"))
 _BSC_TILES = 4  # K-tiles covered by one dwordx4 gather (1024 B / 256 B)
@@ -132,6 +135,89 @@ def _mfma_weave_order(kMChunks, kSubBlocks):
         i0, i1 = sub * 2, sub * 2 + 1
         out += [(i0, 0), (i1, 0), (i0, 1), (i1, 1)]
     return out
+
+
+def _iouter_run(act, nxt_slot, nxt_kt, write_slot, K_C, b_slot, a_nxt, asc_nxt,
+                f_a, f_asc, f_albd, f_bld):
+    """Execute one weave action. Module-level with everything passed explicitly:
+    the DSL AST rewriter mangles closures over a traced function's locals (their
+    captures silently come back empty)."""
+    kind = act[0]
+    if kind == "a":
+        a_nxt[act[1]][act[2]] = f_a(nxt_slot, act[1], act[2])
+    elif kind == "asc":
+        asc_nxt[act[1]] = f_asc(nxt_kt, act[1])
+    elif kind == "albd":
+        f_albd(write_slot, K_C, act[1])
+    elif kind == "bld":
+        f_bld(b_slot, K_C, act[1], act[2])
+
+
+def _build_iouter_plan(kMChunks, kSubBlocks):
+    """Schedule for the i-outer mfma order: for k(2): for i(8): for J(4).
+
+    See resource_inspect/gen_gemm1_iouter_schedule.py, which emits the same plan
+    as a readable listing next to the fp4_gemm_4wave reference.
+
+    The order change is what makes weaving possible. With J outermost (the
+    original), J=0's 16 mfma already touch all 8 M-blocks, so every A ds_read
+    must land before the first mfma -- that is the ~300-cycle dead head we
+    measured. With i outermost, A[i,k] is reused by 4 consecutive mfma, so
+    A[i+1,k] only has to arrive 4 mfma later and hides in A[i]'s shadow.
+    It also stretches the same accumulator's reuse distance from 8 mfma to 32.
+
+    Returns (carry, weave):
+      carry -- issued at the END of the previous iteration: what the first mfma
+               needs (A[0,0] A[0,1] Asc[0]).
+      weave -- [(mfma_index, action)] for this iteration, action being
+               ("a",i,k) / ("asc",sub) / ("albd",sub) / ("bld",j,half).
+               Every entry is placed before its first consumer, and no two VMEM
+               ops land within 2 mfma of each other (back-to-back buffer_loads
+               queue on L1 and their issue latency blows up).
+    """
+    order = [(k, i, j) for k in range(2) for i in range(kMChunks) for j in range(4)]
+    first_a = {}
+    for n, (k, i, _j) in enumerate(order):
+        first_a.setdefault((i, k), n)
+
+    carry = [("asc", 0), ("a", 0, 0), ("a", 0, 1)]
+
+    # ds_read queue, ordered by deadline; A[0,*] and Asc[0] come in on the carry.
+    todo = [(first_a[(i, k)], ("a", i, k)) for k in range(2) for i in range(1, kMChunks)]
+    todo += [(first_a[(2 * s, 0)], ("asc", s)) for s in range(1, kSubBlocks)]
+    # next iteration's carry, re-read at the end so it is freshest
+    todo += [(len(order), a) for a in carry]
+    todo.sort(key=lambda x: x[0])
+
+    # VMEM: 4 albd (no deadline this iteration -- the NEXT barrier publishes the
+    # slot) + 8 B loads (free to move only because B is triple-buffered).
+    vmem = [("albd", s) for s in range(kSubBlocks)]
+    vmem += [("bld", j, h) for h in range(2) for j in range(4)]
+    step = len(order) // (len(vmem) + 1)
+    vmem_at = {1 + step * (n + 1): v for n, v in enumerate(vmem)}
+
+    weave = []
+    ti = 0
+    for n in range(len(order)):
+        if n in vmem_at:
+            weave.append((n, vmem_at[n]))
+            continue
+        if ti < len(todo):
+            deadline, act = todo[ti]
+            if n < deadline:
+                weave.append((n, act))
+                ti += 1
+    for _, act in todo[ti:]:
+        weave.append((len(order) - 1, act))
+
+    # VMEM ops issued after the LAST albd. The steady fence must use exactly
+    # this count so it retires all 4 albd (the barrier that follows publishes
+    # that A slot to the other 3 waves) without draining anything else.
+    vm_seq = [a for _, a in weave if a[0] in ("albd", "bld")]
+    post_albd = len(vm_seq) - 1 - max(
+        i for i, a in enumerate(vm_seq) if a[0] == "albd"
+    )
+    return carry, weave, post_albd
 
 
 def _pipe_alloc(pipe, shape):
@@ -353,7 +439,7 @@ def _gemm1_body(
     # indices. cached_actual_row above is built inside `range_constexpr`, which
     # makes it unusable from a helper called with a python int sub.
     _wrows = [None] * (BM // 32 if BM >= 32 else 1)
-    if const_expr(_ILV and BM == 128 and not inline_quant):
+    if const_expr((_ILV or _IOUT) and BM == 128 and not inline_quant):
         # range_constexpr (a real python unroll) -- a bare `range` here is
         # rewritten into a dynamic scf.for, which cannot carry a python list.
         for sub in range_constexpr(BM // 32):
@@ -699,6 +785,26 @@ def _gemm1_body(
             )
             b_slot[j][half] = Vec(frag)
 
+    def issue_b_load_one(b_slot, K_C, j, half):
+        """One B buffer_load, for weaving individually into the mfma stream.
+        Only legal to place freely when B is triple-buffered (_BDEEP): with 2
+        buffers this write races the mfma still reading the same slot."""
+        v = (
+            (lane_div_16 * fx.Int32(256))
+            + (lane_mod_16 * fx.Int32(16))
+            + fx.Int32(K_C * 2048)
+        )
+        b_slot[j][half] = Vec(
+            buffer_ops.buffer_load(
+                bq_rsrc,
+                (v + fx.Int32(half * 1024)) // fx.Int32(4),
+                vec_width=4,
+                dtype=T.i32,
+                cache_modifier=b_aux,
+                soffset_bytes=b_load_s_base[j],
+            )
+        )
+
     def issue_b_scale_load(bs_slot, K_C):
         v = ((lane_div_16 * fx.Int32(16)) + lane_mod_16) * fx.Int32(4)
         K_C_HI = K_C // 16
@@ -842,6 +948,50 @@ def _gemm1_body(
                 )
                 _weave_tick(_wv, _cur, stride, _wctx, _wfns, _wap, _wsp)
 
+    def mfma_iouter(b_slot, b_wr, a, a_scale, bs_slot, init, weave, ctx,
+                    a_nxt, asc_nxt):
+        """Emit all 64 mfma in i-outer order (k, i, J) with `weave` woven in.
+
+        Original order is J outermost, which gives A zero reuse inside a quad and
+        forces all 19 ds_reads to complete before the first mfma. Here A[i,k] is
+        shared by 4 consecutive mfma (one per J), so the next A can be read in
+        their shadow, and the same accumulator is revisited every 32 mfma instead
+        of every 8.
+        """
+        nxt_slot, nxt_kt, write_slot, K_C = ctx
+        at = {}
+        for n, act in weave:
+            at.setdefault(n, []).append(act)
+        n = 0
+        for k in range_constexpr(2):
+            for i in range_constexpr(kMChunks):
+                a_ik = a[i][k]
+                sa = a_scale[i // 2]
+                # opsel selects the byte lane of the packed e8m0 scale:
+                # A side (i%2) + 2k, B side (J//2) + 2k -- same encoding the
+                # J-outer mfma_cluster uses.
+                osa = (i % 2) + 2 * k
+                for J in range_constexpr(4):
+                    # matches mfma_cluster (interleave=False): the B-scale slot
+                    # is indexed by J%2 while the opsel byte-lane uses J//2.
+                    osb = (J // 2) + 2 * k
+                    # Zero only on the very first mfma of an accumulator, i.e.
+                    # k==0 of the first iteration. k==1 always accumulates onto
+                    # k==0's result -- zeroing it too drops half the K-tile.
+                    src = zero4 if const_expr(init and k == 0) else accm[i][J]
+                    accm[i][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                        mfma_ty,
+                        [a_ik, b_slot[J][k], src, 4, 4, osa, sa, osb, bs_slot[J % 2]],
+                    )
+                    for act in at.get(n, ()):
+                        _iouter_run(
+                            act, nxt_slot, nxt_kt, write_slot, K_C, b_wr,
+                            a_nxt, asc_nxt,
+                            issue_a_ds_read_one, issue_a_scale_ds_read_one,
+                            issue_a_load_lds_one, issue_b_load_one,
+                        )
+                    n += 1
+
     _relax_prologue = (BM == 128) and not inline_quant
     # ADSRD: rotate the A / A-scale ds_reads one iteration EARLIER, so they issue
     # at the END of the previous iteration (inside its mfma shadow) instead of in
@@ -854,6 +1004,10 @@ def _gemm1_body(
     _adsrd = _ADSRD and (BM == 128) and not inline_quant
     _bsc_x4 = _BSC_X4 and (BM == 128) and not inline_quant
     _ilv = _ILV and (BM == 128) and not inline_quant
+    _iout = _IOUT and _BDEEP and (BM == 128) and not inline_quant
+    _IOUT_CARRY, _IOUT_WEAVE, _IOUT_POST_ALBD = _build_iouter_plan(
+        kMChunks, kSubBlocks
+    )
     _PRO, _TH = _build_thunk_plan(kMChunks, kSubBlocks)
     if const_expr(not inline_quant):
         issue_a_scale_load()
@@ -890,7 +1044,7 @@ def _gemm1_body(
     # publish slot 0, so it sits right after a full barrier here.
     a_pipe = [None, None]
     asc_pipe = [None, None]
-    if const_expr(_adsrd or _ilv):
+    if const_expr(_adsrd or _ilv or _iout):
         gpu.barrier()
         asc_pipe[0] = issue_a_scale_ds_read(0)
         a_pipe[0] = issue_a_ds_read(0)
@@ -917,7 +1071,18 @@ def _gemm1_body(
             # and this iteration's tail ds_read of that slot is safe. In flight at
             # this point = iter OFFSET-1's 14 VMEM issued albd(4) -> bld(8) ->
             # bsc(2), so vmcnt(10) retires exactly the 4 oldest = the albd.
-            _fv = 10 if const_expr(_adsrd or _ilv) else _FENCE_VMCNT
+            # The fence must retire the previous iteration's albd, because the
+            # barrier right after it is what publishes that A slot to the other
+            # 3 waves. The count is "how many VMEM ops the weave issues AFTER
+            # the last albd": _adsrd/_ilv keep the original albd -> bld -> bsc
+            # order (4 albd first, then 10), while _iout's plan puts the 4 albd
+            # at mfma 5/9/13/17 followed by exactly 8 B loads.
+            if const_expr(_iout):
+                _fv = _IOUT_POST_ALBD
+            elif const_expr(_adsrd or _ilv):
+                _fv = 10
+            else:
+                _fv = _FENCE_VMCNT
             llvm.InlineAsmOp(
                 None, [], f"s_waitcnt vmcnt({_fv})", "", has_side_effects=True
             )
@@ -927,7 +1092,7 @@ def _gemm1_body(
         _weave = None
         _wctx = (0, 0, 0, 0)
         _wcur = [0, 0]
-        if const_expr(_ilv):
+        if const_expr(_ilv or _iout):
             # A / A-scale for THIS iteration were prefetched by the previous one
             # (or by the prologue), so the mfma stream starts right after the
             # barrier with no ds_read block in front of it.
@@ -985,13 +1150,26 @@ def _gemm1_body(
                 bs_cur = _ref
         else:
             bs_cur = b_scale_v[slot_bsc]
-        if const_expr(not inline_quant and not _ilv): # True
+        if const_expr(not inline_quant and not _ilv and not _iout): # True
             issue_a_load_lds(write_slot, K_C) # d2s
         if const_expr(inline_quant): # False
             h_v0 = inline_quant_load_kt(0, K_C, cached_row_inline[0])
             h_v1 = inline_quant_load_kt(1, K_C, cached_row_inline[0])
             rocdl.sched_barrier(0)
-        for J in range_constexpr(4):
+        if const_expr(_iout):
+            # i-outer: all 64 mfma emitted together, every load woven in.
+            _pipe_alloc(a_pipe, (kMChunks,))
+            _pipe_alloc(asc_pipe, kSubBlocks)
+            mfma_iouter(
+                b[slot_b], b[write_b], a_cur, asc_cur, bs_cur,
+                (OFFSET == 0), _IOUT_WEAVE,
+                ((OFFSET + 1) % kAStages,
+                 min(K_C - kStages + 1, K_TILES_TOTAL - 1),
+                 write_slot, K_C),
+                a_pipe[1], asc_pipe[1],
+            )
+        else:
+          for J in range_constexpr(4):
             if const_expr(BM != 128):
                 rocdl.sched_barrier(0)
                 rocdl.s_setprio(1)
@@ -1048,6 +1226,10 @@ def _gemm1_body(
                     a_pipe, asc_pipe,
                 )
             _wcur[0] = len(_weave)
+            _rotate_pipe(a_pipe)
+            _rotate_pipe(asc_pipe)
+        if const_expr(_iout):
+            # what this iteration prefetched becomes the next one's operands
             _rotate_pipe(a_pipe)
             _rotate_pipe(asc_pipe)
         if const_expr(inline_quant):
