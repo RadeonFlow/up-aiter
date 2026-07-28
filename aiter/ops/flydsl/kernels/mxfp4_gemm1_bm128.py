@@ -797,25 +797,24 @@ def _gemm1_body(
                       *[(b[write_b], K_C, j, h)
                         for h in range(2) for j in range(4)])
         )
+        if const_expr(_bsc_x4):
+            # One gather covers _BSC_TILES tiles, so it only runs on the first
+            # iteration of a group -- which gives the next group a full group of
+            # VMEM to land behind. Issuing it on the LAST iteration would leave
+            # one iteration of lead and the fence would retire nothing (nan).
+            # It goes after the B loads so it does not move the last albd, which
+            # is what sets the fence; being the newest op in flight costs it
+            # nothing, since nobody reads it for another four iterations.
+            _grp = OFFSET // _BSC_TILES + 1
+            if const_expr(OFFSET % _BSC_TILES == 0
+                          and _grp * _BSC_TILES < K_TILES_TOTAL):
+                il = il + _thunks(issue_b_scale_gather, (_grp,))
         mfma_iouter(
             b[slot_b], a_cur, asc_cur, bs_cur, (OFFSET == 0),
             il, _IOUT_STRIDE,
         )
-        if const_expr(_bsc_x4):
-            # One gather every _BSC_TILES iterations instead of 2 loads every
-            # iteration. Issue it on the FIRST iteration of the current group, so
-            # the next group's gather has a full _BSC_TILES iterations (~56 VMEM
-            # ops) to land before its first read. Issuing it on the LAST iteration
-            # leaves only one iteration of lead, and the steady vmcnt(14) fence
-            # then retires nothing -- the read races the gather (verified: nan).
-            # The slot written is the other one of the 2, so the group being read
-            # right now is untouched.
-            if const_expr((OFFSET % _BSC_TILES) == 0):
-                nxt_grp = OFFSET // _BSC_TILES + 1
-                if const_expr(nxt_grp * _BSC_TILES < K_TILES_TOTAL):
-                    issue_b_scale_gather(nxt_grp)
-        else:
-            issue_b_scale_load(b_scale_v[slot_bsc], K_C) # 2 * B32?
+        if const_expr(not _bsc_x4):
+            issue_b_scale_load(b_scale_v[slot_bsc], K_C)
         # what this iteration prefetched becomes the next one's operands
         _rotate_pipe(a_pipe)
         _rotate_pipe(asc_pipe)
