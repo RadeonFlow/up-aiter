@@ -43,6 +43,13 @@ from .mxfp4_gemm_common import (
 )
 
 
+# Experiment knobs (env-driven so a sweep never needs a source edit; every run
+# must still use a cold FlyDSL cache -- see /dev/shm/nocache.py).
+_ASM_ALBD = __import__("os").environ.get("GEMM1_ASM_ALBD", "0") == "1"
+_FENCE_VMCNT = int(__import__("os").environ.get("GEMM1_FENCE_VMCNT", "14"))
+_ADSRD = __import__("os").environ.get("GEMM1_ADSRD", "0") == "1"
+
+
 def _udiv(a, c):
     cc = fx.Int32(c) if isinstance(c, int) else c
     return fx.Int32(arith.divui(_raw(a), _raw(cc)))
@@ -252,15 +259,35 @@ def _gemm1_body(
                 memref_dialect.extract_aligned_pointer_as_index(s_aq.get())
             )
             off = fx.Int32(slot * (BM * KH_TILE)) + lds_row * fx.Int32(KH_TILE)
-            rocdl.raw_ptr_buffer_load_lds(
-                aq_rsrc,
-                _lds_ptr3(base_i32, off),
-                fx.Int32(16),
-                voffset,
-                fx.Int32(kt * KH_TILE),
-                fx.Int32(0),
-                fx.Int32(0),
-            )
+            if const_expr(_ASM_ALBD):
+                # INLINE-ASM g2s (fp4_gemm_4wave idiom): LLVM sees no LDS write
+                # here, so its alias analysis stops inserting the extra
+                # `s_waitcnt vmcnt(10)` before the following ds_reads. The A slot
+                # read this iteration was filled kAStages iters ago and is already
+                # covered by our explicit vmcnt fence.
+                m0 = rocdl.readfirstlane(T.i32, _raw(base_i32 + off))
+                llvm.inline_asm(
+                    None,
+                    [
+                        _raw(m0),
+                        _raw(voffset),
+                        _raw(aq_rsrc),
+                        _raw(fx.Int32(kt * KH_TILE)),
+                    ],
+                    "s_mov_b32 m0, $0\nbuffer_load_dwordx4 $1, $2, $3 offen lds",
+                    "s,v,s,s",
+                    has_side_effects=True,
+                )
+            else:
+                rocdl.raw_ptr_buffer_load_lds(
+                    aq_rsrc,
+                    _lds_ptr3(base_i32, off),
+                    fx.Int32(16),
+                    voffset,
+                    fx.Int32(kt * KH_TILE),
+                    fx.Int32(0),
+                    fx.Int32(0),
+                )
 
     def issue_a_ds_read(slot):
         mask = _lds_swizzle_mask(lane_mod_16)
@@ -538,6 +565,15 @@ def _gemm1_body(
                 )
 
     _relax_prologue = (BM == 128) and not inline_quant
+    # ADSRD: rotate the A / A-scale ds_reads one iteration EARLIER, so they issue
+    # at the END of the previous iteration (inside its mfma shadow) instead of in
+    # the ~300-cycle bare window between s_barrier and the first mfma (ATT: that
+    # head is 19% of the steady iteration with zero mfma covering it).
+    # Safe because kAStages=3: iter OFFSET reads slot OFFSET%3, which was filled by
+    # the albd of iter OFFSET-2 and published by the barrier at the top of OFFSET-1.
+    # So iter OFFSET-1 may already read it, and the concurrent albd of OFFSET-1
+    # writes slot (OFFSET+1)%3 -- a different buffer.
+    _adsrd = _ADSRD and (BM == 128) and not inline_quant
     if const_expr(not inline_quant):
         issue_a_scale_load()
     for K_C in range_constexpr(kStages):
@@ -564,6 +600,15 @@ def _gemm1_body(
                 issue_b_load_j(b[K_C], K_C, j)
             issue_b_scale_load(b_scale_v[K_C], K_C)
 
+    # ADSRD prologue: iteration 0's A/A-scale ds_reads. Needs the first barrier to
+    # publish slot 0, so it sits right after a full barrier here.
+    a_pipe = [None]
+    asc_pipe = [None]
+    if const_expr(_adsrd):
+        gpu.barrier()
+        asc_pipe[0] = issue_a_scale_ds_read(0)
+        a_pipe[0] = issue_a_ds_read(0)
+
     for OFFSET in range_constexpr(kUnroll): #  28 主循环.
         K_C = kStages + OFFSET # 2 + i
         read_slot = OFFSET % kAStages # 
@@ -574,13 +619,23 @@ def _gemm1_body(
         # VMEM. Compiler can't see the double-buffer -> drains to vmcnt(10);
         # relax to vmcnt(14) (don't gate VMEM). s_barrier keeps 4-wave sync.
         if const_expr(BM == 128):
+            # ADSRD needs the PREVIOUS iteration's 4 albd drained *before* the
+            # barrier, so the barrier publishes slot (OFFSET+1)%3 to all 4 waves
+            # and this iteration's tail ds_read of that slot is safe. In flight at
+            # this point = iter OFFSET-1's 14 VMEM issued albd(4) -> bld(8) ->
+            # bsc(2), so vmcnt(10) retires exactly the 4 oldest = the albd.
+            _fv = 10 if const_expr(_adsrd) else _FENCE_VMCNT
             llvm.InlineAsmOp(
-                None, [], "s_waitcnt vmcnt(14)", "", has_side_effects=True
+                None, [], f"s_waitcnt vmcnt({_fv})", "", has_side_effects=True
             )
             rocdl.s_barrier()
         else:
             gpu.barrier()
-        if const_expr(BM == 128):
+        if const_expr(_adsrd):
+            # issued at the tail of the previous iteration, inside its mfma shadow
+            asc_cur = asc_pipe[0]
+            a_cur = a_pipe[0]
+        elif const_expr(BM == 128):
             asc_cur = issue_a_scale_ds_read(K_C - kStages) # 4 次 read.
             a_cur = issue_a_ds_read(read_slot)
         else: # Fales
@@ -604,6 +659,15 @@ def _gemm1_body(
             rocdl.sched_barrier(0)
             issue_b_load_j(b[slot_b], K_C, J) # 2 * B128
             rocdl.sched_barrier(0)
+            if const_expr(_adsrd and J == 1):
+                # Next iteration's A/A-scale, issued mid-mfma so the LDS latency
+                # overlaps the remaining 32 mfma. Slot (OFFSET+1)%kAStages was
+                # filled by iter OFFSET-1's albd and published by this iteration's
+                # top barrier; the albd running now targets a different slot.
+                nxt = (OFFSET + 1) % kAStages
+                asc_pipe[0] = issue_a_scale_ds_read(K_C - kStages + 1)
+                a_pipe[0] = issue_a_ds_read(nxt)
+                rocdl.sched_barrier(0)
         issue_b_scale_load(b_scale_v[slot_b], K_C) # 2 * B32?
         if const_expr(inline_quant):
             scale_accum = [fx.Int32(0)]
