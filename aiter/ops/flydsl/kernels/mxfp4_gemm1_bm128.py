@@ -81,7 +81,10 @@ def _a_read_order(kMChunks, kSubBlocks):
     k*32 + i*4, and A-scale[s] at the first i it covers, i = 2s. Sorting by
     that interleaves the two streams -- asc[1] lands between A[2,0] and A[3,0],
     not after all sixteen A fragments. A[0,*] and asc[0] are excluded: they are
-    the next iteration's first operands and go last, so they are the freshest.
+    the next iteration's opening operands, and the caller issues them last so
+    they spend the least time sitting in registers. Folding them in here --
+    where they would sort to the front on deadline 0 -- measures 0.2% slower
+    on all three interleaved A/B pairs.
     """
     out = [(i * 4 + k * 32, ("a", i, k))
            for k in range(2) for i in range(1, kMChunks)]
