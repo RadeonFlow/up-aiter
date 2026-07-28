@@ -383,7 +383,7 @@ def _gemm1_body(
 
     aq_num_records = arith.index_cast(T.index, _raw(i32_ntok * fx.Int32(K_HALF)))
     aq_rsrc = _buffer_rsrc(arg_aq, aq_num_records)
-    _asc_per_mb = max(BM // 32, 1) * kAS_per_chunk_dw * 4
+    _asc_per_mb = max(BM // 32, 1) * kAS_per_chunk_dw * 4 # 28672 = (7168//32)*16*4  224*128.
     ascale_num = arith.index_cast(T.index, _raw(i32_total_m_blocks)) * fx.Index(
         _asc_per_mb
     )
@@ -392,40 +392,27 @@ def _gemm1_body(
     bscale_rsrc = _buffer_rsrc(arg_bscale, BSCALE_BYTES)
 
     lds_base = allocator.get_base()
-    s_aq = SmemPtr(lds_base, lds_off, T.i8, shape=(kAStages * BM * KH_TILE,))
+    s_aq = SmemPtr(lds_base, lds_off, T.i8, shape=(kAStages * BM * KH_TILE,)) # lds_off = 0, kAStages = 3, BM = 128, KH_TILE = 128
     s_asc = SmemPtr(
         lds_base,
         lds_off + kAStages * BM * KH_TILE,
         T.i8,
-        shape=(kSubBlocks * K_TILES_TOTAL * 256,),
+        shape=(kSubBlocks * K_TILES_TOTAL * 256,), # 4 * 28 * 256 = 28KB
     )
     s_bsc = SmemPtr(
         lds_base,
         lds_off + kAStages * BM * KH_TILE + kSubBlocks * K_TILES_TOTAL * 256,
         T.i8,
-        shape=(_BSC_LDS_BYTES,),
+        shape=(_BSC_LDS_BYTES,), # 16KB. 
     )
-    lds_acc = SmemPtr(lds_base, lds_off, T.f32, shape=(BM * BN,))
+    lds_acc = SmemPtr(lds_base, lds_off, T.f32, shape=(BM * BN,)) # 128 * 256 * 4 = 128KB 所以这里是随便共用的.
 
     cached_actual_row = []
-    for sub in range_constexpr(kSubBlocks):
+    for sub in range_constexpr(kSubBlocks): # 4
         idx = m_row + wave * fx.Int32(BM // 4) + fx.Int32(sub * 8) + lane_div_8
         cached_actual_row.append(
-            llvm.load(T.i32, _global_ptr1(arg_mind, idx * fx.Int32(4)))
+            llvm.load(T.i32, _global_ptr1(arg_mind, idx * fx.Int32(4))) # 存会load的x id.
         )
-
-    # Row indices for the weave-able albd, materialized once with plain python
-    # indices. cached_actual_row above is built inside `range_constexpr`, which
-    # makes it unusable from a helper called with a python int sub.
-    _wrows = [None] * (BM // 32)
-    if const_expr(_ILV or _IOUT):
-        # range_constexpr (a real python unroll) -- a bare `range` here is
-        # rewritten into a dynamic scf.for, which cannot carry a python list.
-        for sub in range_constexpr(BM // 32):
-            _widx = m_row + wave * fx.Int32(BM // 4) + fx.Int32(sub * 8) + lane_div_8
-            _wrows[sub] = fx.Int32(
-                llvm.load(T.i32, _global_ptr1(arg_mind, _widx * fx.Int32(4)))
-            )
 
     # -- b_load_s_base[j] (HIP 412-416), readfirstlane'd uniform per wave ------
     N0_HALF = N_OUT // 32
@@ -506,14 +493,16 @@ def _gemm1_body(
     def issue_a_load_lds_one(slot, kt, sub):
         """One albd step, for weaving into the mfma stream.
 
-        Uses the row cached ONCE before the loop (_wrows). Re-issuing the
-        `arg_mind` global load here instead forces the m0 readfirstlane to wait
-        on it, and the compiler inserts an `s_waitcnt vmcnt(0)` before every
-        albd -- which serializes the whole pipeline (measured: 105 of them).
+        Reads the row out of cached_actual_row, loaded once before the loop.
+        Re-issuing the `arg_mind` load here instead makes the m0 readfirstlane
+        depend on it, and the compiler then emits `s_waitcnt vmcnt(0)` before
+        every albd -- 105 of them, serializing the whole pipeline.
         """
         lds_row = wave * fx.Int32(BM // 4) + fx.Int32(sub * 8)
         mask = _lds_swizzle_mask(lds_row + lane_div_8)
-        voffset = ((lane_mod_8 * fx.Int32(16)) ^ mask) + _wrows[sub] * fx.Int32(K_HALF)
+        voffset = ((lane_mod_8 * fx.Int32(16)) ^ mask) + fx.Int32(
+            cached_actual_row[sub]
+        ) * fx.Int32(K_HALF)
         base_i32 = fx.Int32(memref_dialect.extract_aligned_pointer_as_index(s_aq.get()))
         off = fx.Int32(slot * (BM * KH_TILE)) + lds_row * fx.Int32(KH_TILE)
         m0 = rocdl.readfirstlane(T.i32, _raw(base_i32 + off))
