@@ -64,10 +64,10 @@ _BSC_DBG = __import__("os").environ.get("GEMM1_BSC_DBG", "0") == "1"
 # Thunk-interleaved steady loop: instead of a 19-ds_read block before the first
 # mfma, issue only what the first quad needs and weave the rest one per
 # _ILV_STRIDE mfma, so each load hides in an mfma execute shadow.
-_BDEEP = __import__("os").environ.get("GEMM1_BDEEP", "0") == "1"
+_BDEEP = __import__("os").environ.get("GEMM1_BDEEP", "1") == "1"
 # i-outer mfma order (for k: for i: for J) with every load woven in.
 # Requires _BDEEP: the B loads can only move once B is triple-buffered.
-_IOUT = __import__("os").environ.get("GEMM1_IOUT", "0") == "1"
+_IOUT = __import__("os").environ.get("GEMM1_IOUT", "1") == "1"
 _ILV = __import__("os").environ.get("GEMM1_ILV", "0") == "1"
 _ILV_STRIDE = int(__import__("os").environ.get("GEMM1_ILV_STRIDE", "2"))
 _BSC_TILES = 4  # K-tiles covered by one dwordx4 gather (1024 B / 256 B)
