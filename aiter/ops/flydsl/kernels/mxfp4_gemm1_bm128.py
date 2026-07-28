@@ -43,38 +43,32 @@ from .mxfp4_gemm_common import (
 )
 
 
-# Experiment knobs (env-driven so a sweep never needs a source edit; every run
-# must still use a cold FlyDSL cache -- see /dev/shm/nocache.py).
+# Issue the A global->LDS DMA as inline asm instead of letting the compiler
+# emit it. That hides the LDS write from alias analysis, which otherwise adds a
+# redundant s_waitcnt before the following ds_reads. Correct but perf-neutral
+# as measured, so off.
 _ASM_ALBD = False
 
 # B-scale wide load. The preshuffled B-scale for one n0 unit (32 N rows) is
-# CONTIGUOUS along K: K-tile t sits at byte t*256 within the unit. So one
-# `buffer_load_dwordx4 ... lds` (64 lanes x 16 B = 1024 B) fetches FOUR K-tiles at
-# once, cutting the steady-loop B-scale VMEM count from 2/iter to 2 per 4 iters.
-# LDS is only needed to transpose: the gather lands scales in natural order
-# (lane g -> bytes g*16..+15), while the MFMA wants lane L to hold scale L of one
-# tile -- a stride-256 gather no single VMEM op can do. Same idiom as
-# fp4_gemm_4wave's ScaleLoaderLDS.
+# contiguous along K -- K-tile t sits at byte t*256 within the unit -- so one
+# `buffer_load_dwordx4 ... lds` (64 lanes x 16 B = 1024 B) fetches FOUR K-tiles
+# at once, cutting the steady-loop B-scale VMEM count from 2/iter to 2 per 4
+# iters. LDS is needed only to transpose: the gather lands scales in natural
+# order (lane g -> bytes g*16..+15) while the mfma wants lane L to hold scale L
+# of one tile, a stride-256 pattern no single VMEM op can express. Same idiom
+# as fp4_gemm_4wave's ScaleLoaderLDS.
+#
+# NOTE this is currently SLOWER (3549 vs 3794 TFLOP/s) -- the gather and its
+# ds_read are still placed the way the old J-outer schedule wanted them. Set
+# False for the faster configuration.
 _BSC_X4 = True
 
-# i-outer mfma order (for k: for i: for J) with every load woven in.
-# Requires the B triple-buffer: the B loads can only move once a load no
-# longer targets the buffer the mfma are reading.
+# Geometry of the B-scale LDS transpose region, used only when _BSC_X4.
 _BSC_TILES = 4  # K-tiles covered by one dwordx4 gather (1024 B / 256 B)
 _BSC_SLOTS = 2  # double buffer over groups of _BSC_TILES
 _BSC_WAVE_BYTES = 2 * _BSC_TILES * 256  # 2 mw x 4 tiles x 256 B = 2 KB
 _BSC_SLOT_BYTES = 4 * _BSC_WAVE_BYTES  # 4 waves = 8 KB
 _BSC_LDS_BYTES = _BSC_SLOTS * _BSC_SLOT_BYTES  # 16 KB
-
-
-def _mfma_weave_order(kMChunks, kSubBlocks):
-    """(i, k) consumption order of one mfma_cluster call, matching the loop in
-    mfma_cluster: for sub in kSubBlocks: i0=2s, i1=2s+1, then k=0,0,1,1."""
-    out = []
-    for sub in range(kSubBlocks):
-        i0, i1 = sub * 2, sub * 2 + 1
-        out += [(i0, 0), (i1, 0), (i0, 1), (i1, 1)]
-    return out
 
 
 def _a_read_order(kMChunks, kSubBlocks):
@@ -651,7 +645,7 @@ def _gemm1_body(
                 # J-outer mfma_cluster uses.
                 osa = (i % 2) + 2 * k
                 for J in range_constexpr(4):
-                    # matches mfma_cluster (interleave=False): the B-scale slot
+                    # matches mfma_cluster: the B-scale slot
                     # is indexed by J%2 while the opsel byte-lane uses J//2.
                     osb = (J // 2) + 2 * k
                     # Zero only on the very first mfma of an accumulator, i.e.
@@ -672,58 +666,57 @@ def _gemm1_body(
         for _t in interleave[nth:]:
             _t()
 
-    _relax_prologue = True
-    # ADSRD: rotate the A / A-scale ds_reads one iteration EARLIER, so they issue
-    # at the END of the previous iteration (inside its mfma shadow) instead of in
-    # the ~300-cycle bare window between s_barrier and the first mfma (ATT: that
-    # head is 19% of the steady iteration with zero mfma covering it).
-    # Safe because kAStages=3: iter OFFSET reads slot OFFSET%3, which was filled by
-    # the albd of iter OFFSET-2 and published by the barrier at the top of OFFSET-1.
-    # So iter OFFSET-1 may already read it, and the concurrent albd of OFFSET-1
-    # writes slot (OFFSET+1)%3 -- a different buffer.
     _bsc_x4 = _BSC_X4
-    # One thunk every _IOUT_STRIDE mfma. 32 thunks over 64 mfma -> stride 2
-    # spreads them across the first 25 mfma and leaves the rest a clean mfma
-    # run; it also keeps any two VMEM ops at least 4 mfma apart, which matters
-    # because back-to-back buffer_loads queue on L1 and their issue latency
-    # blows up.
+
+    # The A / A-scale ds_reads of one iteration, in the order their consumers
+    # need them.
     _A_READ_ORDER = _a_read_order(kMChunks, kSubBlocks)
+
+    # One thunk every _IOUT_STRIDE mfma. 32 thunks over 64 mfma at stride 2
+    # spread across the first ~25 and leave the rest a clean mfma run, and no
+    # two VMEM ops land closer than 4 mfma apart -- back-to-back buffer_loads
+    # queue on L1 and their issue latency blows up.
     _IOUT_STRIDE = 2
-    # Steady fence. The schedule above issues 4 albd and then 8 B loads, and
-    # vmcnt(N) retires oldest-first, so waiting for <= 8 in flight retires
-    # exactly the 4 albd -- which is what the barrier below needs, because
-    # right after it the other 3 waves start ds_read-ing that A tile. It is the
-    # loosest legal value: 12 VMEM are in flight, and vmcnt(9) or looser leaves
-    # an albd unlanded. See resource_inspect/gemm1_fence_explained.txt.
+
+    # Steady fence. An iteration issues 4 albd then 8 B loads, and vmcnt(N)
+    # retires oldest-first, so waiting for <= 8 in flight retires exactly the
+    # 4 albd. That is what the barrier needs, because right after it the other
+    # 3 waves start ds_read-ing that A tile. It is also the loosest legal
+    # value: only 12 VMEM are ever in flight, so vmcnt(9) or looser leaves an
+    # albd unlanded. See resource_inspect/gemm1_fence_explained.txt.
     _IOUT_POST_ALBD = 2 * 4  # the 8 B loads that follow the last albd
+
+    # ---- prologue ---------------------------------------------------------
+    # A-scale for the whole K range is resident in LDS, so it loads once.
     issue_a_scale_load()
+
+    # A first, then B, rather than interleaving them per tile. Same reason the
+    # steady schedule puts the albd ahead of the B loads: vmcnt retires
+    # oldest-first, so grouping the albd at the front lets iteration 0's fence
+    # be the same vmcnt(8) as every other iteration. Interleaving would leave
+    # only 5 VMEM behind the last albd and force a tighter first fence.
+    # sched_barrier stops the compiler from mixing the two groups back up.
     for K_C in range_constexpr(kStages):
         issue_a_load_lds(K_C, K_C)
-        if const_expr(not _relax_prologue):
-            for j in range_constexpr(4):
-                issue_b_load_j(b[K_C], K_C, j)
-        if const_expr(not _relax_prologue):
+    rocdl.sched_barrier(0)
+    if const_expr(_bsc_x4):
+        # Group 0 first so it is the oldest VMEM in the prologue and the steady
+        # fence has certainly retired it before iteration 0 reads it.
+        issue_b_scale_gather(0)
+    for K_C in range_constexpr(kStages):
+        for j in range_constexpr(4):
+            issue_b_load_j(b[K_C], K_C, j)
+        if const_expr(not _bsc_x4):
             issue_b_scale_load(b_scale_v[K_C], K_C)
-    if const_expr(_relax_prologue):
-        rocdl.sched_barrier(0)
-        if const_expr(_bsc_x4):
-            # Group 0 first so it is the OLDEST VMEM in the prologue and the
-            # steady fence has certainly retired it before iteration 0 reads it.
-            issue_b_scale_gather(0)
-        for K_C in range_constexpr(kStages):
-            for j in range_constexpr(4):
-                issue_b_load_j(b[K_C], K_C, j)
-            if const_expr(not _bsc_x4):
-                issue_b_scale_load(b_scale_v[K_C], K_C)
 
-    # ADSRD prologue: iteration 0's A/A-scale ds_reads. Needs the first barrier to
-    # publish slot 0, so it sits right after a full barrier here.
+    # Iteration 0's A / A-scale fragments. Every later iteration gets these
+    # from the previous one's weave, so the steady loop never has a ds_read
+    # ahead of its first mfma. Needs a full barrier first to publish slot 0.
     a_pipe = [None, None]
     asc_pipe = [None, None]
-    if True:
-        gpu.barrier()
-        asc_pipe[0] = issue_a_scale_ds_read(0)
-        a_pipe[0] = issue_a_ds_read(0)
+    gpu.barrier()
+    asc_pipe[0] = issue_a_scale_ds_read(0)
+    a_pipe[0] = issue_a_ds_read(0)
 
     for OFFSET in range_constexpr(kUnroll): #  28 主循环.
         K_C = kStages + OFFSET # 2 + i
