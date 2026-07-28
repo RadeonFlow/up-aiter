@@ -31,6 +31,26 @@ def _get_compiled_mxfp4_gemm1_port(
     interleave=False,
     xcd_swizzle=0,
 ):
+    if BM == 128 and not use_nt and not inline_quant and not interleave:
+        # The tuned MoE path lives in its own file: same kernel, specialised to
+        # this one configuration so the software pipeline reads top to bottom
+        # instead of branching through the other BM / quant variants.
+        from .kernels.mxfp4_gemm1_bm128 import compile_gemm1_a4w4_port as _c128
+
+        return _c128(
+            BM,
+            use_nt,
+            inline_quant,
+            D_HIDDEN=D_HIDDEN,
+            D_INTER=D_INTER,
+            NE=NE,
+            TOPK=topk,
+            BN=BN,
+            BK=BK,
+            interleave=interleave,
+            xcd_swizzle=xcd_swizzle,
+        )
+
     from .kernels.mxfp4_gemm1 import compile_gemm1_a4w4_port
 
     return compile_gemm1_a4w4_port(
