@@ -49,6 +49,23 @@ _ASM_ALBD = __import__("os").environ.get("GEMM1_ASM_ALBD", "0") == "1"
 _FENCE_VMCNT = int(__import__("os").environ.get("GEMM1_FENCE_VMCNT", "14"))
 _ADSRD = __import__("os").environ.get("GEMM1_ADSRD", "0") == "1"
 
+# B-scale wide load. The preshuffled B-scale for one n0 unit (32 N rows) is
+# CONTIGUOUS along K: K-tile t sits at byte t*256 within the unit. So one
+# `buffer_load_dwordx4 ... lds` (64 lanes x 16 B = 1024 B) fetches FOUR K-tiles at
+# once, cutting the steady-loop B-scale VMEM count from 2/iter to 2 per 4 iters.
+# LDS is only needed to transpose: the gather lands scales in natural order
+# (lane g -> bytes g*16..+15), while the MFMA wants lane L to hold scale L of one
+# tile -- a stride-256 gather no single VMEM op can do. Same idiom as
+# fp4_gemm_4wave's ScaleLoaderLDS.
+_BSC_X4 = __import__("os").environ.get("GEMM1_BSC_X4", "0") == "1"
+_BSC_SYNC = __import__("os").environ.get("GEMM1_BSC_SYNC", "0") == "1"
+_BSC_DBG = __import__("os").environ.get("GEMM1_BSC_DBG", "0") == "1"
+_BSC_TILES = 4  # K-tiles covered by one dwordx4 gather (1024 B / 256 B)
+_BSC_SLOTS = 2  # double buffer over groups of _BSC_TILES
+_BSC_WAVE_BYTES = 2 * _BSC_TILES * 256  # 2 mw x 4 tiles x 256 B = 2 KB
+_BSC_SLOT_BYTES = 4 * _BSC_WAVE_BYTES  # 4 waves = 8 KB
+_BSC_LDS_BYTES = _BSC_SLOTS * _BSC_SLOT_BYTES  # 16 KB
+
 
 def _udiv(a, c):
     cc = fx.Int32(c) if isinstance(c, int) else c
@@ -195,6 +212,12 @@ def _gemm1_body(
         lds_off + kAStages * BM * KH_TILE,
         T.i8,
         shape=(kSubBlocks * K_TILES_TOTAL * 256,),
+    )
+    s_bsc = SmemPtr(
+        lds_base,
+        lds_off + kAStages * BM * KH_TILE + kSubBlocks * K_TILES_TOTAL * 256,
+        T.i8,
+        shape=(_BSC_LDS_BYTES,),
     )
     lds_acc = SmemPtr(lds_base, lds_off, T.f32, shape=(BM * BN,))
 
@@ -513,6 +536,53 @@ def _gemm1_body(
                 soffset_bytes=s_off,
             )
 
+    # ---- wide (dwordx4) B-scale path -------------------------------------
+    # gather: lane g reads the 16 contiguous bytes at unit_base + grp*1024 + g*16
+    #   and writes them to LDS at wave_region + g*16. Because the gather is dense
+    #   and in order, i32 j of the unit's 1024-byte window lands at LDS byte j*4,
+    #   i.e. tile t's scale L is at (t*256 + L*4) -- exactly what the ds_read wants.
+    # grp = K_C // _BSC_TILES; the 4 tiles of a group share one gather.
+    bsc_lds_base = fx.Int32(memref_dialect.extract_aligned_pointer_as_index(s_bsc.get()))
+    bsc_wave_off = wave * fx.Int32(_BSC_WAVE_BYTES)
+    bsc_v = lane * fx.Int32(16)
+    bsc_read_v = lane * fx.Int32(4)
+
+    def issue_b_scale_gather(grp):
+        slot = grp % _BSC_SLOTS
+        for mw in range_constexpr(2):
+            lds_off_b = (
+                fx.Int32(slot * _BSC_SLOT_BYTES)
+                + bsc_wave_off
+                + fx.Int32(mw * _BSC_TILES * 256)
+            )
+            m0 = rocdl.readfirstlane(T.i32, _raw(bsc_lds_base + lds_off_b))
+            # byte offset of this group inside the n0 unit = grp*_BSC_TILES*256
+            s_off = rocdl.readfirstlane(
+                T.i32, _raw(b_scale_s_base[mw] + fx.Int32(grp * _BSC_TILES * 256))
+            )
+            llvm.inline_asm(
+                None,
+                [_raw(m0), _raw(bsc_v), _raw(bscale_rsrc), _raw(s_off)],
+                "s_mov_b32 m0, $0\nbuffer_load_dwordx4 $1, $2, $3 offen lds",
+                "s,v,s,s",
+                has_side_effects=True,
+            )
+
+    def read_b_scale(K_C):
+        grp = K_C // _BSC_TILES
+        t = K_C - grp * _BSC_TILES
+        slot = grp % _BSC_SLOTS
+        out = [None, None]
+        base_ptr = _lds_base_ptr3(s_bsc.get())
+        for mw in range_constexpr(2):
+            off = (
+                fx.Int32(slot * _BSC_SLOT_BYTES + mw * _BSC_TILES * 256 + t * 256)
+                + bsc_wave_off
+                + bsc_read_v
+            )
+            out[mw] = fx.Int32(llvm.load(T.i32, _gep3(base_ptr, off)))
+        return out
+
     mfma_ty = T.f32x4
     zero4 = Vec.filled(4, 0.0, fx.Float32)
 
@@ -574,6 +644,7 @@ def _gemm1_body(
     # So iter OFFSET-1 may already read it, and the concurrent albd of OFFSET-1
     # writes slot (OFFSET+1)%3 -- a different buffer.
     _adsrd = _ADSRD and (BM == 128) and not inline_quant
+    _bsc_x4 = _BSC_X4 and (BM == 128) and not inline_quant
     if const_expr(not inline_quant):
         issue_a_scale_load()
     for K_C in range_constexpr(kStages):
@@ -595,10 +666,15 @@ def _gemm1_body(
             issue_b_scale_load(b_scale_v[K_C], K_C)
     if const_expr(_relax_prologue):
         rocdl.sched_barrier(0)
+        if const_expr(_bsc_x4):
+            # Group 0 first so it is the OLDEST VMEM in the prologue and the
+            # steady fence has certainly retired it before iteration 0 reads it.
+            issue_b_scale_gather(0)
         for K_C in range_constexpr(kStages):
             for j in range_constexpr(4):
                 issue_b_load_j(b[K_C], K_C, j)
-            issue_b_scale_load(b_scale_v[K_C], K_C)
+            if const_expr(not _bsc_x4):
+                issue_b_scale_load(b_scale_v[K_C], K_C)
 
     # ADSRD prologue: iteration 0's A/A-scale ds_reads. Needs the first barrier to
     # publish slot 0, so it sits right after a full barrier here.
@@ -641,6 +717,30 @@ def _gemm1_body(
         else: # Fales
             a_cur = issue_a_ds_read(read_slot)
             asc_cur = issue_a_scale_ds_read(K_C - kStages)
+        if const_expr(_bsc_x4):
+            if const_expr(_BSC_SYNC):
+                # DIAGNOSTIC: gather this tile's group right here and drain fully
+                # before reading. If this still produces nan the bug is in the
+                # gather/read address math, not in the pipeline timing.
+                issue_b_scale_gather(OFFSET // _BSC_TILES)
+                llvm.InlineAsmOp(
+                    None, [], "s_waitcnt vmcnt(0) lgkmcnt(0)", "", has_side_effects=True
+                )
+            # tile OFFSET's scales, gathered ~4 iterations ago (>=48 VMEM ops), so
+            # the vmcnt fence above has long retired that dwordx4. Each wave owns
+            # its own LDS region here, so no cross-wave barrier is needed.
+            bs_cur = read_b_scale(OFFSET)
+            if const_expr(_BSC_DBG):
+                # DIAGNOSTIC: overwrite the LDS-sourced scales with the known-good
+                # direct path. Any residual error is then NOT the B-scale gather.
+                _ref = [None, None]
+                issue_b_scale_load(_ref, OFFSET)
+                llvm.InlineAsmOp(
+                    None, [], "s_waitcnt vmcnt(0)", "", has_side_effects=True
+                )
+                bs_cur = _ref
+        else:
+            bs_cur = b_scale_v[slot_b]
         if const_expr(not inline_quant): # True
             issue_a_load_lds(write_slot, K_C) # d2s
         if const_expr(inline_quant): # False
@@ -652,7 +752,7 @@ def _gemm1_body(
                 rocdl.sched_barrier(0)
                 rocdl.s_setprio(1)
             mfma_cluster(
-                b[slot_b], a_cur, asc_cur, b_scale_v[slot_b], J, init=(OFFSET == 0)
+                b[slot_b], a_cur, asc_cur, bs_cur, J, init=(OFFSET == 0)
             )
             if const_expr(BM != 128):
                 rocdl.s_setprio(0)
@@ -668,7 +768,21 @@ def _gemm1_body(
                 asc_pipe[0] = issue_a_scale_ds_read(K_C - kStages + 1)
                 a_pipe[0] = issue_a_ds_read(nxt)
                 rocdl.sched_barrier(0)
-        issue_b_scale_load(b_scale_v[slot_b], K_C) # 2 * B32?
+        if const_expr(_bsc_x4):
+            # One gather every _BSC_TILES iterations instead of 2 loads every
+            # iteration. Issue it on the FIRST iteration of the current group, so
+            # the next group's gather has a full _BSC_TILES iterations (~56 VMEM
+            # ops) to land before its first read. Issuing it on the LAST iteration
+            # leaves only one iteration of lead, and the steady vmcnt(14) fence
+            # then retires nothing -- the read races the gather (verified: nan).
+            # The slot written is the other one of the 2, so the group being read
+            # right now is untouched.
+            if const_expr((OFFSET % _BSC_TILES) == 0):
+                nxt_grp = OFFSET // _BSC_TILES + 1
+                if const_expr(nxt_grp * _BSC_TILES < K_TILES_TOTAL):
+                    issue_b_scale_gather(nxt_grp)
+        else:
+            issue_b_scale_load(b_scale_v[slot_b], K_C) # 2 * B32?
         if const_expr(inline_quant):
             scale_accum = [fx.Int32(0)]
             _inline_quant_core_pair(
@@ -685,14 +799,14 @@ def _gemm1_body(
         else:
             a_cur = issue_a_ds_read(kt % kAStages)
             asc_cur = issue_a_scale_ds_read(kt)
+        bs_t = read_b_scale(kt) if const_expr(_bsc_x4) else b_scale_v[kt % kStages]
         for J in range_constexpr(4):
-            mfma_cluster(
-                b[kt % kStages], a_cur, asc_cur, b_scale_v[kt % kStages], J, init=False
-            )
+            mfma_cluster(b[kt % kStages], a_cur, asc_cur, bs_t, J, init=False)
 
     gpu.barrier()
     s_aq._view_cache = None
     s_asc._view_cache = None
+    s_bsc._view_cache = None
     lds_acc._view_cache = None
 
     wave_n = wave
@@ -815,7 +929,9 @@ def _bm_constants(BM, BN, KH_TILE, K_TILES_TOTAL):
     s_aq_bytes = kAStages * BM * KH_TILE
     s_asc_bytes = kSubBlocks * K_TILES_TOTAL * 256
     lds_acc_bytes = lds_acc_bytes_for(BM, BN)
-    lds_bytes = max(s_aq_bytes + s_asc_bytes, lds_acc_bytes)
+    lds_bytes = max(
+        s_aq_bytes + s_asc_bytes + (_BSC_LDS_BYTES if _BSC_X4 else 0), lds_acc_bytes
+    )
     return kAStages, kSubBlocks, kMChunks, lds_bytes
 
 
