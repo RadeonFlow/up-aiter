@@ -64,6 +64,7 @@ _BSC_DBG = __import__("os").environ.get("GEMM1_BSC_DBG", "0") == "1"
 # Thunk-interleaved steady loop: instead of a 19-ds_read block before the first
 # mfma, issue only what the first quad needs and weave the rest one per
 # _ILV_STRIDE mfma, so each load hides in an mfma execute shadow.
+_BDEEP = __import__("os").environ.get("GEMM1_BDEEP", "0") == "1"
 _ILV = __import__("os").environ.get("GEMM1_ILV", "0") == "1"
 _ILV_STRIDE = int(__import__("os").environ.get("GEMM1_ILV_STRIDE", "2"))
 _BSC_TILES = 4  # K-tiles covered by one dwordx4 gather (1024 B / 256 B)
@@ -394,7 +395,15 @@ def _gemm1_body(
         b_scale_s_base_hi.append(base + fx.Int32(16 * kBS_stride_k0_dw * 4))
 
     accm = [[None] * 4 for _ in range(kMChunks)]
-    b = [[[None, None] for _ in range(4)] for _ in range(kStages)]
+    # B is triple-buffered when _BDEEP: with only 2 buffers the load that refills
+    # b[slot_b] targets the very buffer this iteration's mfma are still reading,
+    # so bld[j] may not be issued before the last mfma that reads B[j] (WAR).
+    # That pins all 8 B loads to fixed points in the schedule. With 3 buffers the
+    # load writes a slot nobody is reading, so it can go anywhere -- which is
+    # what lets the loads be spread evenly through the mfma stream.
+    # Cost is 32 VGPR (4 J x 2 halves x i32x4); the kernel uses 284 of 512.
+    kBStages = 3 if _BDEEP else kStages
+    b = [[[None, None] for _ in range(4)] for _ in range(kBStages)]
     b_scale_v = [[None, None] for _ in range(kStages)]
 
     def issue_a_load_lds(slot, kt):
@@ -890,7 +899,14 @@ def _gemm1_body(
         K_C = kStages + OFFSET # 2 + i
         read_slot = OFFSET % kAStages # 
         write_slot = K_C % kAStages
-        slot_b = OFFSET % kStages
+        slot_b = OFFSET % kBStages
+        # B-scale keeps its own 2-deep register buffer (independent of the B
+        # data buffers), so it is indexed with kStages, not kBStages.
+        slot_bsc = OFFSET % kStages
+        # Tile K_C = OFFSET+kStages is the one being prefetched. With kBStages=3
+        # its slot differs from the slot being read (OFFSET%3), so the refill has
+        # no WAR against this iteration's mfma and can be issued anywhere.
+        write_b = K_C % kBStages
         # Steady fence: A read from read_slot was written by iter OFFSET-2
         # (already landed), so barrier need NOT wait on this iter's 14 in-flight
         # VMEM. Compiler can't see the double-buffer -> drains to vmcnt(10);
@@ -968,7 +984,7 @@ def _gemm1_body(
                 )
                 bs_cur = _ref
         else:
-            bs_cur = b_scale_v[slot_b]
+            bs_cur = b_scale_v[slot_bsc]
         if const_expr(not inline_quant and not _ilv): # True
             issue_a_load_lds(write_slot, K_C) # d2s
         if const_expr(inline_quant): # False
@@ -991,7 +1007,7 @@ def _gemm1_body(
                 rocdl.s_setprio(0)
             if const_expr(not _ilv):
                 rocdl.sched_barrier(0)
-            issue_b_load_j(b[slot_b], K_C, J) # 2 * B128
+            issue_b_load_j(b[write_b], K_C, J) # 2 * B128
             if const_expr(not _ilv):
                 rocdl.sched_barrier(0)
             if const_expr(_adsrd and J == 1):
@@ -1017,7 +1033,7 @@ def _gemm1_body(
                 if const_expr(nxt_grp * _BSC_TILES < K_TILES_TOTAL):
                     issue_b_scale_gather(nxt_grp)
         else:
-            issue_b_scale_load(b_scale_v[slot_b], K_C) # 2 * B32?
+            issue_b_scale_load(b_scale_v[slot_bsc], K_C) # 2 * B32?
         if const_expr(_ilv):
             # Drain any thunk the 64 mfma did not reach, then rotate the carry:
             # what this iteration prefetched becomes the next one's operands.
@@ -1052,7 +1068,7 @@ def _gemm1_body(
             asc_cur = issue_a_scale_ds_read(kt)
         bs_t = read_b_scale(kt) if const_expr(_bsc_x4) else b_scale_v[kt % kStages]
         for J in range_constexpr(4):
-            mfma_cluster(b[kt % kStages], a_cur, asc_cur, bs_t, J, init=False)
+            mfma_cluster(b[kt % kBStages], a_cur, asc_cur, bs_t, J, init=False)
 
     gpu.barrier()
     s_aq._view_cache = None
