@@ -45,9 +45,9 @@ from .mxfp4_gemm_common import (
 
 # Experiment knobs (env-driven so a sweep never needs a source edit; every run
 # must still use a cold FlyDSL cache -- see /dev/shm/nocache.py).
-_ASM_ALBD = __import__("os").environ.get("GEMM1_ASM_ALBD", "0") == "1"
-_FENCE_VMCNT = int(__import__("os").environ.get("GEMM1_FENCE_VMCNT", "14"))
-_ADSRD = __import__("os").environ.get("GEMM1_ADSRD", "0") == "1"
+_ASM_ALBD = False
+_FENCE_VMCNT = 14
+_ADSRD = False
 
 # B-scale wide load. The preshuffled B-scale for one n0 unit (32 N rows) is
 # CONTIGUOUS along K: K-tile t sits at byte t*256 within the unit. So one
@@ -57,19 +57,17 @@ _ADSRD = __import__("os").environ.get("GEMM1_ADSRD", "0") == "1"
 # (lane g -> bytes g*16..+15), while the MFMA wants lane L to hold scale L of one
 # tile -- a stride-256 gather no single VMEM op can do. Same idiom as
 # fp4_gemm_4wave's ScaleLoaderLDS.
-_BSC_X4 = __import__("os").environ.get("GEMM1_BSC_X4", "0") == "1"
-_BSC_SYNC = __import__("os").environ.get("GEMM1_BSC_SYNC", "0") == "1"
-_BSC_DBG = __import__("os").environ.get("GEMM1_BSC_DBG", "0") == "1"
+_BSC_X4 = False
 
 # Thunk-interleaved steady loop: instead of a 19-ds_read block before the first
 # mfma, issue only what the first quad needs and weave the rest one per
 # _ILV_STRIDE mfma, so each load hides in an mfma execute shadow.
-_BDEEP = __import__("os").environ.get("GEMM1_BDEEP", "1") == "1"
+_BDEEP = True
 # i-outer mfma order (for k: for i: for J) with every load woven in.
 # Requires _BDEEP: the B loads can only move once B is triple-buffered.
-_IOUT = __import__("os").environ.get("GEMM1_IOUT", "1") == "1"
-_ILV = __import__("os").environ.get("GEMM1_ILV", "0") == "1"
-_ILV_STRIDE = int(__import__("os").environ.get("GEMM1_ILV_STRIDE", "2"))
+_IOUT = True
+_ILV = False
+_ILV_STRIDE = 2
 _BSC_TILES = 4  # K-tiles covered by one dwordx4 gather (1024 B / 256 B)
 _BSC_SLOTS = 2  # double buffer over groups of _BSC_TILES
 _BSC_WAVE_BYTES = 2 * _BSC_TILES * 256  # 2 mw x 4 tiles x 256 B = 2 KB
@@ -1127,27 +1125,10 @@ def _gemm1_body(
             a_cur = issue_a_ds_read(read_slot)
             asc_cur = issue_a_scale_ds_read(K_C - kStages)
         if const_expr(_bsc_x4):
-            if const_expr(_BSC_SYNC):
-                # DIAGNOSTIC: gather this tile's group right here and drain fully
-                # before reading. If this still produces nan the bug is in the
-                # gather/read address math, not in the pipeline timing.
-                issue_b_scale_gather(OFFSET // _BSC_TILES)
-                llvm.InlineAsmOp(
-                    None, [], "s_waitcnt vmcnt(0) lgkmcnt(0)", "", has_side_effects=True
-                )
             # tile OFFSET's scales, gathered ~4 iterations ago (>=48 VMEM ops), so
             # the vmcnt fence above has long retired that dwordx4. Each wave owns
             # its own LDS region here, so no cross-wave barrier is needed.
             bs_cur = read_b_scale(OFFSET)
-            if const_expr(_BSC_DBG):
-                # DIAGNOSTIC: overwrite the LDS-sourced scales with the known-good
-                # direct path. Any residual error is then NOT the B-scale gather.
-                _ref = [None, None]
-                issue_b_scale_load(_ref, OFFSET)
-                llvm.InlineAsmOp(
-                    None, [], "s_waitcnt vmcnt(0)", "", has_side_effects=True
-                )
-                bs_cur = _ref
         else:
             bs_cur = b_scale_v[slot_bsc]
         if const_expr(not inline_quant and not _ilv and not _iout): # True
