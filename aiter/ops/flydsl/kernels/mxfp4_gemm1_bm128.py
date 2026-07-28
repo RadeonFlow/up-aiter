@@ -342,7 +342,6 @@ def _gemm1_body(
     bx_i32,
     lane,
     wave,
-    use_nt,
     i32_ntok,
     i32_total_m_blocks,
     *,
@@ -366,10 +365,8 @@ def _gemm1_body(
     NUM_N_BLOCKS,
     OUT_AS_PER_CHUNK_DW,
     K_G2_HALF,
-    interleave=False,
 ):
     BN_INT = BN // 2
-    b_aux = 2 if use_nt else 0
     M_REPS = BM // 16
 
     n_block_idx = bx_i32 % fx.Int32(NUM_N_BLOCKS)
@@ -434,25 +431,16 @@ def _gemm1_body(
     N0_HALF = N_OUT // 32
     b_load_s_base = []
     for j in range_constexpr(4):
-        if const_expr(interleave):
-            col = (
-                n_block_idx * fx.Int32(BN) + wave * fx.Int32(BN // 4) + fx.Int32(j * 16)
-            )
-        else:
-            tile_il = n_block_idx * fx.Int32(16) + wave * fx.Int32(4) + fx.Int32(j)
-            g = tile_il & fx.Int32(1)
-            n0 = tile_il >> fx.Int32(1)
-            col = (g * fx.Int32(N0_HALF) + n0) * fx.Int32(16)
+        tile_il = n_block_idx * fx.Int32(16) + wave * fx.Int32(4) + fx.Int32(j)
+        g = tile_il & fx.Int32(1)
+        n0 = tile_il >> fx.Int32(1)
+        col = (g * fx.Int32(N0_HALF) + n0) * fx.Int32(16)
         v = (e * fx.Int32(N_OUT) + col) * fx.Int32(K_HALF)
         b_load_s_base.append(rocdl.readfirstlane(T.i32, v))
 
     # -- b_scale_s_base / _hi (HIP 418-429) -----------------------------------
-    if const_expr(interleave):
-        mni_base = n_block_idx * fx.Int32(BN // 32) + wave * fx.Int32(BN // 128)
-        np_list = [mni_base, mni_base + fx.Int32(1)]
-    else:
-        np_gate = n_block_idx * fx.Int32(BN // 64) + wave
-        np_list = [np_gate, np_gate + fx.Int32(N_OUT // 64)]
+    np_gate = n_block_idx * fx.Int32(BN // 64) + wave
+    np_list = [np_gate, np_gate + fx.Int32(N_OUT // 64)]
     b_scale_s_base, b_scale_s_base_hi = [], []
     for mw in range_constexpr(2):
         base = (
@@ -638,7 +626,6 @@ def _gemm1_body(
                 (v + fx.Int32(half * 1024)) // fx.Int32(4),
                 vec_width=4,
                 dtype=T.i32,
-                cache_modifier=b_aux,
                 soffset_bytes=b_load_s_base[j],
             )
             b_slot[j][half] = Vec(frag)
@@ -658,7 +645,6 @@ def _gemm1_body(
                 (v + fx.Int32(half * 1024)) // fx.Int32(4),
                 vec_width=4,
                 dtype=T.i32,
-                cache_modifier=b_aux,
                 soffset_bytes=b_load_s_base[j],
             )
         )
@@ -753,12 +739,8 @@ def _gemm1_body(
         _wap = wpipes[0] if wpipes is not None else [None, []]
         _wsp = wpipes[1] if wpipes is not None else [None, []]
 
-        if const_expr(interleave):
-            mni = J // 2
-            in_b = J % 2
-        else:
-            mni = J % 2
-            in_b = J // 2
+        mni = J % 2
+        in_b = J // 2
         sb = bs_slot[mni]
         bJ0, bJ1 = b_slot[J][0], b_slot[J][1]
         if const_expr(kMChunks == 1):
@@ -1183,7 +1165,6 @@ def _bm_constants(BM, BN, KH_TILE, K_TILES_TOTAL):
 
 def compile_gemm1_a4w4_port(
     BM=128,
-    use_nt=False,
     *,
     D_HIDDEN,
     D_INTER,
@@ -1191,12 +1172,11 @@ def compile_gemm1_a4w4_port(
     TOPK,
     BN=256,
     BK=256,
-    interleave=False,
     xcd_swizzle=0,
 ):
-    assert BM == 128 and not use_nt, (
-        f"mxfp4_gemm1_bm128 is the BM=128 cached path only; got BM={BM} "
-        f"use_nt={use_nt}. Other variants live in mxfp4_gemm1.py."
+    assert BM == 128, (
+        f"mxfp4_gemm1_bm128 is the BM=128 cached path only; got BM={BM}. "
+        "Other variants live in mxfp4_gemm1.py."
     )
 
     assert BN == 256 and BK == 256, f"only BN==BK==256 supported, got BN={BN} BK={BK}"
@@ -1228,7 +1208,7 @@ def compile_gemm1_a4w4_port(
     variant_tag = "cached"
     # Tag with H/INTER/NE so different shape specializations get distinct
     # kernel/smem symbols (so KIMI and non-KIMI instances never collide).
-    gu_tag = "il" if interleave else "sep"
+    gu_tag = "sep"
     name_suffix = f"h{_K}_i{_INTER}_ne{_NE}_bm{BM}_{variant_tag}_{gu_tag}"
     if xcd_swizzle > 0:
         name_suffix += f"_xcd{xcd_swizzle}"
@@ -1305,7 +1285,6 @@ def compile_gemm1_a4w4_port(
                 _tile,
                 lane,
                 wave,
-                use_nt,
                 i32_ntok,
                 total_m_blocks,
                 BM=BM,
@@ -1328,7 +1307,6 @@ def compile_gemm1_a4w4_port(
                 NUM_N_BLOCKS=_NUM_N_BLOCKS,
                 OUT_AS_PER_CHUNK_DW=_OUT_AS_PER_CHUNK_DW,
                 K_G2_HALF=_K_G2_HALF,
-                interleave=interleave,
             )
 
     @flyc.jit

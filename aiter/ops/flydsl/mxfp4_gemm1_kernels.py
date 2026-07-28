@@ -39,14 +39,12 @@ def _get_compiled_mxfp4_gemm1_port(
 
         return _c128(
             BM,
-            use_nt,
             D_HIDDEN=D_HIDDEN,
             D_INTER=D_INTER,
             NE=NE,
             TOPK=topk,
             BN=BN,
             BK=BK,
-            interleave=interleave,
             xcd_swizzle=xcd_swizzle,
         )
 
