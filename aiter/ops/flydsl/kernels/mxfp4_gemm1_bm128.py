@@ -57,7 +57,7 @@ _ADSRD = False
 # (lane g -> bytes g*16..+15), while the MFMA wants lane L to hold scale L of one
 # tile -- a stride-256 gather no single VMEM op can do. Same idiom as
 # fp4_gemm_4wave's ScaleLoaderLDS.
-_BSC_X4 = False
+_BSC_X4 = True
 
 # i-outer mfma order (for k: for i: for J) with every load woven in.
 # Requires the B triple-buffer: the B loads can only move once a load no
