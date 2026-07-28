@@ -322,11 +322,7 @@ def _inline_e8m0(amax_u16_i32):
 
 def gemm1_grid(n_tokens, BM, *, NE, TOPK, INTER, BN=256):
     num_n_blocks = num_n_blocks_for(n_out_for(INTER), BN)
-    if BM == 128:
-        max_m_blocks = (n_tokens * TOPK + NE * (BM - 1) + BM - 1) // BM
-    else:
-        active = min(n_tokens * TOPK, NE)
-        max_m_blocks = (n_tokens * TOPK + active * (BM - 1) + BM - 1) // BM
+    max_m_blocks = (n_tokens * TOPK + NE * (BM - 1) + BM - 1) // BM
     return max_m_blocks * num_n_blocks
 
 
@@ -357,7 +353,6 @@ def _gemm1_body(
     kAStages,
     kSubBlocks,
     kMChunks,
-    inline_quant=False,
     K,
     K_HALF,
     K_TILES_TOTAL,
@@ -398,10 +393,6 @@ def _gemm1_body(
     ascale_rsrc = _buffer_rsrc(arg_ascale, ascale_num)
     bq_rsrc = _buffer_rsrc(arg_bq, BQ_BYTES)
     bscale_rsrc = _buffer_rsrc(arg_bscale, BSCALE_BYTES)
-    hidden_rsrc = None
-    if const_expr(inline_quant):
-        hidden_num = arith.index_cast(T.index, _raw(i32_ntok * fx.Int32(K * 2)))
-        hidden_rsrc = _buffer_rsrc(arg_hidden, hidden_num)
 
     lds_base = allocator.get_base()
     s_aq = SmemPtr(lds_base, lds_off, T.i8, shape=(kAStages * BM * KH_TILE,))
@@ -420,24 +411,17 @@ def _gemm1_body(
     lds_acc = SmemPtr(lds_base, lds_off, T.f32, shape=(BM * BN,))
 
     cached_actual_row = []
-    cached_row_inline = []
-    if const_expr(inline_quant):
-        rcls = wave * fx.Int32(4) + lane_div_16
-        cached_row_inline = [
-            llvm.load(T.i32, _global_ptr1(arg_mind, (m_row + rcls) * fx.Int32(4)))
-        ]
-    else:
-        for sub in range_constexpr(kSubBlocks):
-            idx = m_row + wave * fx.Int32(BM // 4) + fx.Int32(sub * 8) + lane_div_8
-            cached_actual_row.append(
-                llvm.load(T.i32, _global_ptr1(arg_mind, idx * fx.Int32(4)))
-            )
+    for sub in range_constexpr(kSubBlocks):
+        idx = m_row + wave * fx.Int32(BM // 4) + fx.Int32(sub * 8) + lane_div_8
+        cached_actual_row.append(
+            llvm.load(T.i32, _global_ptr1(arg_mind, idx * fx.Int32(4)))
+        )
 
     # Row indices for the weave-able albd, materialized once with plain python
     # indices. cached_actual_row above is built inside `range_constexpr`, which
     # makes it unusable from a helper called with a python int sub.
-    _wrows = [None] * (BM // 32 if BM >= 32 else 1)
-    if const_expr((_ILV or _IOUT) and BM == 128 and not inline_quant):
+    _wrows = [None] * (BM // 32)
+    if const_expr(_ILV or _IOUT):
         # range_constexpr (a real python unroll) -- a bare `range` here is
         # rewritten into a dynamic scf.for, which cannot carry a python list.
         for sub in range_constexpr(BM // 32):
@@ -641,130 +625,6 @@ def _gemm1_body(
     lib = lane & fx.Int32(3)
     lane_shr2_and3 = (lane >> fx.Int32(2)) & fx.Int32(3)
     r_in_chunk = wave * fx.Int32(4) + lane_div_16
-
-    def inline_quant_load_kt(B128_IDX, kt, row_token):
-        v_voff = (
-            row_token * fx.Int32(K * 2)
-            + lane_shr2_and3 * fx.Int32(64)
-            + lib * fx.Int32(16)
-        )
-        s_soff = rocdl.readfirstlane(T.i32, fx.Int32(kt * (BK * 2) + B128_IDX * 256))
-        frag = buffer_ops.buffer_load(
-            hidden_rsrc,
-            v_voff // fx.Int32(4),
-            vec_width=4,
-            dtype=T.i32,
-            soffset_bytes=s_soff,
-        )
-        return Vec(frag)
-
-    def _inline_quant_core(B128_IDX, SUB, slot, kt, h_v, scale_accum):
-        h_dw = [fx.Int32(_raw(h_v[j])) for j in range_constexpr(4)]
-        hm = [h_dw[j] & fx.Int32(0x7FFF7FFF) for j in range_constexpr(4)]
-        m01 = _pkmax_u16(hm[0], hm[1])
-        m23 = _pkmax_u16(hm[2], hm[3])
-        m0123 = _pkmax_u16(m01, m23)
-        lo = m0123 & fx.Int32(0xFFFF)
-        hi = m0123.shrui(fx.Int32(16)) & fx.Int32(0xFFFF)
-        local_amax = _umax_i32(lo, hi)
-        amax_u32 = _inline_dpp_quad_amax(local_amax)
-        e8m0 = _inline_e8m0(amax_u32)
-        qs = fx.Float32(_raw(e8m0 << fx.Int32(23)).bitcast(T.f32))
-        pk = _raw(fx.Int32(0))
-        qs_raw = _raw(qs)
-        for j in range_constexpr(4):
-            src_bf16x2 = _raw(
-                Vec.from_elements([h_dw[j]], fx.Int32).bitcast(fx.BFloat16)
-            )
-            pk = rocdl.cvt_scalef32_pk_fp4_bf16(T.i32, pk, src_bf16x2, qs_raw, j)
-        pk = fx.Int32(pk)
-        r = fx.Int32(SUB * 16) + r_in_chunk
-        kb_in_kt = fx.Int32(B128_IDX * 4) + lane_shr2_and3
-        mask_r = _lds_swizzle_mask(r)
-        b_off = lib * fx.Int32(4)
-        aq_base = fx.Int32(memref_dialect.extract_aligned_pointer_as_index(s_aq.get()))
-        off = (
-            fx.Int32(slot * (BM * KH_TILE))
-            + r * fx.Int32(KH_TILE)
-            + ((kb_in_kt * fx.Int32(16)) ^ mask_r)
-            + b_off
-        )
-        llvm.StoreOp(_raw(pk), _lds_ptr3(aq_base, off))
-        pack_byte = B128_IDX * 2 + SUB
-        scale_accum[0] = scale_accum[0] | (e8m0 << fx.Int32(pack_byte * 8))
-
-    def _inline_quant_core_pair(specs, slot, kt, scale_accum):
-        n = len(specs)
-        h_dw = [
-            [fx.Int32(_raw(h_v[j])) for j in range_constexpr(4)]
-            for (_b, _s, h_v) in specs
-        ]
-        la = [None] * n
-        for i in range_constexpr(n):
-            hm = [h_dw[i][j] & fx.Int32(0x7FFF7FFF) for j in range_constexpr(4)]
-            m01 = _pkmax_u16(hm[0], hm[1])
-            m23 = _pkmax_u16(hm[2], hm[3])
-            m0123 = _pkmax_u16(m01, m23)
-            lo = m0123 & fx.Int32(0xFFFF)
-            hi = m0123.shrui(fx.Int32(16)) & fx.Int32(0xFFFF)
-            la[i] = _umax_i32(lo, hi)
-        a = [fx.Int32(_raw(la[i])) for i in range_constexpr(n)]
-        s1 = [
-            fx.Int32(
-                dpp_utils.update_dpp_i32(_raw(a[i]), _raw(a[i]), 0xB1, 0xF, 0xF, True)
-            )
-            for i in range_constexpr(n)
-        ]
-        a = [_umax_i32(a[i], s1[i]) for i in range_constexpr(n)]
-        s2 = [
-            fx.Int32(
-                dpp_utils.update_dpp_i32(_raw(a[i]), _raw(a[i]), 0x4E, 0xF, 0xF, True)
-            )
-            for i in range_constexpr(n)
-        ]
-        a = [_umax_i32(a[i], s2[i]) for i in range_constexpr(n)]
-        e8 = [_inline_e8m0(a[i]) for i in range_constexpr(n)]
-        for i in range_constexpr(n):
-            B128_IDX, SUB, _hv = specs[i]
-            qs_raw = _raw(fx.Float32(_raw(e8[i] << fx.Int32(23)).bitcast(T.f32)))
-            pk = _raw(fx.Int32(0))
-            for j in range_constexpr(4):
-                src_bf16x2 = _raw(
-                    Vec.from_elements([h_dw[i][j]], fx.Int32).bitcast(fx.BFloat16)
-                )
-                pk = rocdl.cvt_scalef32_pk_fp4_bf16(T.i32, pk, src_bf16x2, qs_raw, j)
-            pk = fx.Int32(pk)
-            r = fx.Int32(SUB * 16) + r_in_chunk
-            kb_in_kt = fx.Int32(B128_IDX * 4) + lane_shr2_and3
-            mask_r = _lds_swizzle_mask(r)
-            b_off = lib * fx.Int32(4)
-            aq_base = fx.Int32(
-                memref_dialect.extract_aligned_pointer_as_index(s_aq.get())
-            )
-            off = (
-                fx.Int32(slot * (BM * KH_TILE))
-                + r * fx.Int32(KH_TILE)
-                + ((kb_in_kt * fx.Int32(16)) ^ mask_r)
-                + b_off
-            )
-            llvm.StoreOp(_raw(pk), _lds_ptr3(aq_base, off))
-            pack_byte = B128_IDX * 2 + SUB
-            scale_accum[0] = scale_accum[0] | (e8[i] << fx.Int32(pack_byte * 8))
-
-    def inline_quant_kt(B128_IDX, SUB, slot, kt, row_token, scale_accum):
-        h_v = inline_quant_load_kt(B128_IDX, kt, row_token)
-        _inline_quant_core(B128_IDX, SUB, slot, kt, h_v, scale_accum)
-
-    def inline_quant_finish_kt(B128_IDX, SUB, slot, kt, h_v, scale_accum):
-        _inline_quant_core(B128_IDX, SUB, slot, kt, h_v, scale_accum)
-
-    def inline_quant_pack_write(kt, scale_accum):
-        lane_tgt = lane_shr2_and3 * fx.Int32(16) + r_in_chunk
-        asc_base = fx.Int32(
-            memref_dialect.extract_aligned_pointer_as_index(s_asc.get())
-        )
-        off = fx.Int32(kt * 256) + lane_tgt * fx.Int32(4)
-        llvm.StoreOp(_raw(scale_accum[0]), _lds_ptr3(asc_base, off))
 
     def issue_b_load_j(b_slot, K_C, j):
         v = (
@@ -990,7 +850,7 @@ def _gemm1_body(
                         )
                     n += 1
 
-    _relax_prologue = (BM == 128) and not inline_quant
+    _relax_prologue = True
     # ADSRD: rotate the A / A-scale ds_reads one iteration EARLIER, so they issue
     # at the END of the previous iteration (inside its mfma shadow) instead of in
     # the ~300-cycle bare window between s_barrier and the first mfma (ATT: that
@@ -999,31 +859,20 @@ def _gemm1_body(
     # the albd of iter OFFSET-2 and published by the barrier at the top of OFFSET-1.
     # So iter OFFSET-1 may already read it, and the concurrent albd of OFFSET-1
     # writes slot (OFFSET+1)%3 -- a different buffer.
-    _adsrd = _ADSRD and (BM == 128) and not inline_quant
-    _bsc_x4 = _BSC_X4 and (BM == 128) and not inline_quant
-    _ilv = _ILV and (BM == 128) and not inline_quant
-    _iout = _IOUT and _BDEEP and (BM == 128) and not inline_quant
+    _adsrd = _ADSRD
+    _bsc_x4 = _BSC_X4
+    _ilv = _ILV
+    _iout = _IOUT and _BDEEP
     _IOUT_CARRY, _IOUT_WEAVE, _IOUT_POST_ALBD = _build_iouter_plan(
         kMChunks, kSubBlocks
     )
     _PRO, _TH = _build_thunk_plan(kMChunks, kSubBlocks)
-    if const_expr(not inline_quant):
-        issue_a_scale_load()
+    issue_a_scale_load()
     for K_C in range_constexpr(kStages):
-        if const_expr(inline_quant):
-            scale_accum = [fx.Int32(0)]
-            inline_quant_kt(0, 0, K_C, K_C, cached_row_inline[0], scale_accum)
-            issue_b_load_j(b[K_C], K_C, 0)
-            issue_b_load_j(b[K_C], K_C, 1)
-            inline_quant_kt(1, 0, K_C, K_C, cached_row_inline[0], scale_accum)
-            issue_b_load_j(b[K_C], K_C, 2)
-            issue_b_load_j(b[K_C], K_C, 3)
-            inline_quant_pack_write(K_C, scale_accum)
-        else:
-            issue_a_load_lds(K_C, K_C)
-            if const_expr(not _relax_prologue):
-                for j in range_constexpr(4):
-                    issue_b_load_j(b[K_C], K_C, j)
+        issue_a_load_lds(K_C, K_C)
+        if const_expr(not _relax_prologue):
+            for j in range_constexpr(4):
+                issue_b_load_j(b[K_C], K_C, j)
         if const_expr(not _relax_prologue):
             issue_b_scale_load(b_scale_v[K_C], K_C)
     if const_expr(_relax_prologue):
@@ -1063,7 +912,7 @@ def _gemm1_body(
         # (already landed), so barrier need NOT wait on this iter's 14 in-flight
         # VMEM. Compiler can't see the double-buffer -> drains to vmcnt(10);
         # relax to vmcnt(14) (don't gate VMEM). s_barrier keeps 4-wave sync.
-        if const_expr(BM == 128):
+        if True:
             # ADSRD needs the PREVIOUS iteration's 4 albd drained *before* the
             # barrier, so the barrier publishes slot (OFFSET+1)%3 to all 4 waves
             # and this iteration's tail ds_read of that slot is safe. In flight at
@@ -1118,12 +967,9 @@ def _gemm1_body(
             # issued at the tail of the previous iteration, inside its mfma shadow
             asc_cur = asc_pipe[0]
             a_cur = a_pipe[0]
-        elif const_expr(BM == 128):
-            asc_cur = issue_a_scale_ds_read(K_C - kStages) # 4 次 read.
-            a_cur = issue_a_ds_read(read_slot)
-        else: # Fales
-            a_cur = issue_a_ds_read(read_slot)
+        else:
             asc_cur = issue_a_scale_ds_read(K_C - kStages)
+            a_cur = issue_a_ds_read(read_slot)
         if const_expr(_bsc_x4):
             # tile OFFSET's scales, gathered ~4 iterations ago (>=48 VMEM ops), so
             # the vmcnt fence above has long retired that dwordx4. Each wave owns
@@ -1131,12 +977,8 @@ def _gemm1_body(
             bs_cur = read_b_scale(OFFSET)
         else:
             bs_cur = b_scale_v[slot_bsc]
-        if const_expr(not inline_quant and not _ilv and not _iout): # True
+        if const_expr(not _ilv and not _iout):
             issue_a_load_lds(write_slot, K_C) # d2s
-        if const_expr(inline_quant): # False
-            h_v0 = inline_quant_load_kt(0, K_C, cached_row_inline[0])
-            h_v1 = inline_quant_load_kt(1, K_C, cached_row_inline[0])
-            rocdl.sched_barrier(0)
         if const_expr(_iout):
             # i-outer: all 64 mfma emitted together, every load woven in.
             _pipe_alloc(a_pipe, (kMChunks,))
@@ -1151,9 +993,6 @@ def _gemm1_body(
             )
         else:
           for J in range_constexpr(4):
-            if const_expr(BM != 128):
-                rocdl.sched_barrier(0)
-                rocdl.s_setprio(1)
             # One shared weave cursor across all 4 quads: 24 thunks at stride 2
             # need 48 of the 64 mfma, so they spread over the whole iteration
             # rather than bunching into J=0.
@@ -1162,8 +1001,6 @@ def _gemm1_body(
                 weave=_weave, stride=_ILV_STRIDE, cursor=_wcur,
                 wctx=_wctx, wpipes=(a_pipe, asc_pipe),
             )
-            if const_expr(BM != 128):
-                rocdl.s_setprio(0)
             if const_expr(not _ilv):
                 rocdl.sched_barrier(0)
             issue_b_load_j(b[write_b], K_C, J) # 2 * B128
@@ -1213,22 +1050,12 @@ def _gemm1_body(
             # what this iteration prefetched becomes the next one's operands
             _rotate_pipe(a_pipe)
             _rotate_pipe(asc_pipe)
-        if const_expr(inline_quant):
-            scale_accum = [fx.Int32(0)]
-            _inline_quant_core_pair(
-                [(0, 0, h_v0), (1, 0, h_v1)], write_slot, K_C, scale_accum
-            )
-            inline_quant_pack_write(K_C, scale_accum)
 
     for S in range_constexpr(kStages):
         kt = K_TILES_TOTAL - kStages + S
         gpu.barrier()
-        if const_expr(BM == 128):
-            asc_cur = issue_a_scale_ds_read(kt)
-            a_cur = issue_a_ds_read(kt % kAStages)
-        else:
-            a_cur = issue_a_ds_read(kt % kAStages)
-            asc_cur = issue_a_scale_ds_read(kt)
+        asc_cur = issue_a_scale_ds_read(kt)
+        a_cur = issue_a_ds_read(kt % kAStages)
         bs_t = read_b_scale(kt) if const_expr(_bsc_x4) else b_scale_v[kt % kStages]
         for J in range_constexpr(4):
             mfma_cluster(b[kt % kBStages], a_cur, asc_cur, bs_t, J, init=False)
@@ -1320,18 +1147,7 @@ def _gemm1_body(
     if kk == fx.Int32(0):
         ku = n_block_idx >> fx.Int32(1)
         ikxdl = n_block_idx & fx.Int32(1)
-        if const_expr(BM == 16):
-            chunk = m_block_idx
-            dword_off = (
-                chunk * fx.Int32(OUT_AS_PER_CHUNK_DW)
-                + ku * fx.Int32(64)
-                + wave_grp * fx.Int32(16)
-                + m_lane
-            )
-            addr = dword_off * fx.Int32(4) + ikxdl * fx.Int32(2)
-            byte_i8 = arith.TruncIOp(T.i8, _raw(scales_per_mr[0])).result
-            llvm.StoreOp(byte_i8, _gep1(ascaleout_base, addr), alignment=1)
-        else:
+        if True:
             for sub in range_constexpr(kSubBlocks):
                 chunk = m_block_idx * fx.Int32(kSubBlocks) + fx.Int32(sub)
                 dword_off = (
@@ -1354,7 +1170,7 @@ def _gemm1_body(
 
 def _bm_constants(BM, BN, KH_TILE, K_TILES_TOTAL):
     kAStages = 3
-    kSubBlocks = 1 if BM < 32 else BM // 32
+    kSubBlocks = BM // 32
     kMChunks = kmchunks_for(BM)
     s_aq_bytes = kAStages * BM * KH_TILE
     s_asc_bytes = kSubBlocks * K_TILES_TOTAL * 256
@@ -1366,9 +1182,8 @@ def _bm_constants(BM, BN, KH_TILE, K_TILES_TOTAL):
 
 
 def compile_gemm1_a4w4_port(
-    BM=32,
-    use_nt=True,
-    inline_quant=False,
+    BM=128,
+    use_nt=False,
     *,
     D_HIDDEN,
     D_INTER,
@@ -1379,16 +1194,10 @@ def compile_gemm1_a4w4_port(
     interleave=False,
     xcd_swizzle=0,
 ):
-    if (BM, use_nt, inline_quant) not in {
-        (32, True, False),
-        (32, False, False),
-        (64, False, False),
-        (128, False, False),
-        (16, True, True),
-    }:
-        raise AssertionError(
-            f"unsupported gemm1 variant (BM={BM}, use_nt={use_nt}, inline_quant={inline_quant})"
-        )
+    assert BM == 128 and not use_nt, (
+        f"mxfp4_gemm1_bm128 is the BM=128 cached path only; got BM={BM} "
+        f"use_nt={use_nt}. Other variants live in mxfp4_gemm1.py."
+    )
 
     assert BN == 256 and BK == 256, f"only BN==BK==256 supported, got BN={BN} BK={BK}"
     KH_TILE = BK // 2
@@ -1416,7 +1225,7 @@ def compile_gemm1_a4w4_port(
         BM, BN, KH_TILE, _K_TILES_TOTAL
     )
 
-    variant_tag = "iq" if inline_quant else ("nt" if use_nt else "cached")
+    variant_tag = "cached"
     # Tag with H/INTER/NE so different shape specializations get distinct
     # kernel/smem symbols (so KIMI and non-KIMI instances never collide).
     gu_tag = "il" if interleave else "sep"
@@ -1506,7 +1315,6 @@ def compile_gemm1_a4w4_port(
                 kAStages=kAStages,
                 kSubBlocks=kSubBlocks,
                 kMChunks=kMChunks,
-                inline_quant=inline_quant,
                 K=_K,
                 K_HALF=_K_HALF,
                 K_TILES_TOTAL=_K_TILES_TOTAL,

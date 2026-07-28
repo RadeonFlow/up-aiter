@@ -40,7 +40,6 @@ def _get_compiled_mxfp4_gemm1_port(
         return _c128(
             BM,
             use_nt,
-            inline_quant,
             D_HIDDEN=D_HIDDEN,
             D_INTER=D_INTER,
             NE=NE,
