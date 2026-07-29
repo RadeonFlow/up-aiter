@@ -47,7 +47,7 @@ from .mxfp4_gemm_common import (
 # emit it. That hides the LDS write from alias analysis, which otherwise adds a
 # redundant s_waitcnt before the following ds_reads. Correct but perf-neutral
 # as measured, so off.
-_ASM_ALBD = False
+_ASM_ALBD = True
 
 # B-scale wide load. The preshuffled B-scale for one n0 unit (32 N rows) is
 # contiguous along K -- K-tile t sits at byte t*256 within the unit -- so one
