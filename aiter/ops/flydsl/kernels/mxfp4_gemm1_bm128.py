@@ -657,6 +657,17 @@ def _gemm1_body(
     # (12 ops) between an albd and the fence that has to cover it.
     _IOUT_POST_ALBD = 2 * 4 + (12 if _ALATE else 0)
 
+    # B data loads issued after everything the first ds_reads need.
+    # The prologue issues, in order: 16 A-scale DMAs, 8 albd, 2 B-scale
+    # gathers, then 16 B data loads. Only the first three groups have to be
+    # resident before the barrier that follows, so leaving 16 in flight lets
+    # the B loads keep going. Swept: 16 matches vmcnt(0) bit for bit, 24 and
+    # above start to drift.
+    _PROLOGUE_VM = 16
+    # The drain only needs the last A tiles published; B is long since in
+    # registers. Correct at 0, 8 and 16 alike.
+    _DRAIN_VM = 8
+
     # ---- prologue ---------------------------------------------------------
     # A-scale for the whole K range is resident in LDS, so it loads once.
     issue_a_scale_load()
@@ -683,7 +694,18 @@ def _gemm1_body(
     a_pipe = [None, None]
     asc_pipe = [None, None]
     bsc_pipe = [None, None]
-    gpu.barrier()
+    # Not gpu.barrier(): that emits vmcnt(0) lgkmcnt(0), draining the 16 B data
+    # loads too. They go to VGPRs for iteration 0's mfma and the compiler
+    # tracks them itself; only the A-scale DMAs, the albd and the B-scale
+    # gather have to be resident, and they were all issued before the B loads.
+    # A bare s_barrier is NOT enough -- it syncs program position but does not
+    # drain VMEM, and each wave writes only 32 of the 128 A rows the others
+    # read, so the wait has to happen before the barrier, not after it.
+    llvm.InlineAsmOp(
+        None, [], f"s_waitcnt vmcnt({_PROLOGUE_VM}) lgkmcnt(0)", "",
+        has_side_effects=True,
+    )
+    rocdl.s_barrier()
     asc_pipe[0] = issue_a_scale_ds_read(0)
     a_pipe[0] = issue_a_ds_read(0)
     bsc_pipe[0] = read_b_scale(0)
@@ -790,7 +812,15 @@ def _gemm1_body(
 
     for S in range_constexpr(kStages):
         kt = K_TILES_TOTAL - kStages + S
-        gpu.barrier()
+        # Same reasoning as the prologue barrier: the wait has to precede the
+        # s_barrier because each wave only writes a quarter of the A rows the
+        # others are about to read, but nothing here still needs the B loads
+        # drained -- those landed in registers during the main loop.
+        llvm.InlineAsmOp(
+            None, [], f"s_waitcnt vmcnt({_DRAIN_VM}) lgkmcnt(0)", "",
+            has_side_effects=True,
+        )
+        rocdl.s_barrier()
         asc_cur = issue_a_scale_ds_read(kt)
         a_cur = issue_a_ds_read(kt % kAStages)
         bs_t = read_b_scale(kt)
