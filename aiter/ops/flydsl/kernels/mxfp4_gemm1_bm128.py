@@ -65,6 +65,36 @@ _BSC_SLOT_BYTES = 4 * _BSC_WAVE_BYTES  # 4 waves = 8 KB
 _BSC_LDS_BYTES = _BSC_SLOTS * _BSC_SLOT_BYTES  # 16 KB
 
 
+def _a_slot_scopes(n):
+    """One #llvm.alias_scope per A LDS slot, all in a shared domain.
+
+    si-insert-waitcnts asks, for every LDS access, whether it may alias any
+    outstanding LDS DMA (SIInsertWaitcnts.cpp:2542). With alias info it checks
+    them one by one and waits only on the overlapping ones; without it, it
+    waits on all of them at once, which for this loop is a full vmcnt(0)
+    immediately ahead of each ds_read. The A tile is triple buffered and
+    iteration N reads slot (N+1)%3 while its DMAs fill (N+2)%3, so they never
+    overlap -- but the addresses are ptrtoint arithmetic off one 128 KB
+    addrspace(3) global, which the backend cannot see through.
+    """
+    from flydsl._mlir import ir
+
+    dom = '#llvm.alias_scope_domain<id = "gemm1.A", description = "A LDS slots">'
+    return [
+        ir.Attribute.parse(f'#llvm.alias_scope<id = "gemm1.A.{i}", domain = {dom}>')
+        for i in range(n)
+    ]
+
+
+def _tag_alias(op, scopes, slot):
+    """Mark `op` as touching only `slot`, and no other A slot."""
+    from flydsl._mlir import ir
+
+    others = [sc for i, sc in enumerate(scopes) if i != slot]
+    op.attributes["alias_scopes"] = ir.ArrayAttr.get([scopes[slot]])
+    op.attributes["noalias_scopes"] = ir.ArrayAttr.get(others)
+
+
 def _a_read_order(kMChunks, kSubBlocks):
     """(kind, *idx) for the A / A-scale ds_reads of one iteration, in deadline
     order.
@@ -267,6 +297,8 @@ def _gemm1_body(
     )
     lds_acc = SmemPtr(lds_base, lds_off, T.f32, shape=(BM * BN,)) # 128 * 256 * 4 = 128KB 所以这里是随便共用的.
 
+    _A_SCOPES = _a_slot_scopes(kAStages)
+
     cached_actual_row = []
     for sub in range_constexpr(kSubBlocks): # 4
         idx = m_row + wave * fx.Int32(BM // 4) + fx.Int32(sub * 8) + lane_div_8
@@ -321,7 +353,7 @@ def _gemm1_body(
         ) * fx.Int32(K_HALF)
         base_i32 = fx.Int32(memref_dialect.extract_aligned_pointer_as_index(s_aq.get()))
         off = fx.Int32(slot * (BM * KH_TILE)) + lds_row * fx.Int32(KH_TILE)
-        rocdl.raw_ptr_buffer_load_lds(
+        _dma = rocdl.raw_ptr_buffer_load_lds(
             aq_rsrc,
             _lds_ptr3(base_i32, off),
             fx.Int32(16),
@@ -330,6 +362,7 @@ def _gemm1_body(
             fx.Int32(0),
             fx.Int32(0),
         )
+        _tag_alias(_dma.owner if hasattr(_dma, "owner") else _dma, _A_SCOPES, slot)
 
     def issue_a_load_lds(slot, kt):
         """All kSubBlocks steps of one tile, for the prologue."""
@@ -343,7 +376,9 @@ def _gemm1_body(
         lds_col = (lane_div_16 * fx.Int32(16) + fx.Int32(k * 64)) ^ mask
         lds_row = lane_mod_16 + fx.Int32(i * 16)
         off = fx.Int32(slot * (BM * KH_TILE)) + lds_row * fx.Int32(KH_TILE) + lds_col
-        return llvm.load(T.vec(4, T.i32), _gep3(base_ptr, off))
+        val = llvm.load(T.vec(4, T.i32), _gep3(base_ptr, off))
+        _tag_alias(val.owner, _A_SCOPES, slot)
+        return val
 
     def issue_a_scale_ds_read_one(kt, sub):
         """One A-scale ds_read -> i32."""
@@ -357,19 +392,11 @@ def _gemm1_body(
         return llvm.load(T.i32, _gep3(base_ptr, lds_dw * fx.Int32(4)))
 
     def issue_a_ds_read(slot):
-        mask = _lds_swizzle_mask(lane_mod_16)
-        base_ptr = _lds_base_ptr3(s_aq.get())
+        """All A fragments of one slot, for the prologue and the drain."""
         a = [[None, None] for _ in range(kMChunks)]
         for k in range_constexpr(2):
-            lds_col = (lane_div_16 * fx.Int32(16) + fx.Int32(k * 64)) ^ mask
             for i in range_constexpr(kMChunks):
-                lds_row = lane_mod_16 + fx.Int32(i * 16)
-                off = (
-                    fx.Int32(slot * (BM * KH_TILE))
-                    + lds_row * fx.Int32(KH_TILE)
-                    + lds_col
-                )
-                a[i][k] = llvm.load(T.vec(4, T.i32), _gep3(base_ptr, off))
+                a[i][k] = issue_a_ds_read_one(slot, i, k)
         return a
 
     def issue_a_scale_load():
