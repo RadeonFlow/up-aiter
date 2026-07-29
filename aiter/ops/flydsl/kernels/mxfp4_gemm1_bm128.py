@@ -63,9 +63,7 @@ _ASM_ALBD = False
 # the read sitting between the barrier and the first mfma. With both woven into
 # the mfma stream it is now +0.8% (3481 vs 3452 TFLOP/s, three interleaved A/B
 # pairs, deltas 28.7 / 29.0 / 29.5 -- small but very repeatable).
-_BSC_X4 = True
-
-# Geometry of the B-scale LDS transpose region, used only when _BSC_X4.
+# Geometry of the B-scale LDS transpose region.
 _BSC_TILES = 4  # K-tiles covered by one dwordx4 gather (1024 B / 256 B)
 _BSC_SLOTS = 2  # double buffer over groups of _BSC_TILES
 _BSC_WAVE_BYTES = 2 * _BSC_TILES * 256  # 2 mw x 4 tiles x 256 B = 2 KB
@@ -131,17 +129,6 @@ def _store_thunks(fn, holder, *specs):
                 h[d] = f(*a)
         out.append(_one)
     return out
-
-
-def _rotate_pipe(pipe):
-    """pipe[0] <- pipe[1], in place.
-
-    Needed only where the rotate sits inside `if const_expr(...)`: the DSL AST
-    rewriter treats a name assigned in a control-flow body as a captured
-    closure variable and drops the store. Outside such a branch a plain
-    assignment is fine.
-    """
-    pipe[0] = pipe[1]
 
 
 def _udiv(a, c):
@@ -307,14 +294,13 @@ def _gemm1_body(
     # -- b_scale_s_base / _hi (HIP 418-429) -----------------------------------
     np_gate = n_block_idx * fx.Int32(BN // 64) + wave # n_bid * 4 + wave
     np_list = [np_gate, np_gate + fx.Int32(N_OUT // 64)]
-    b_scale_s_base, b_scale_s_base_hi = [], []
+    b_scale_s_base = []
     for mw in range_constexpr(2):
         base = (
             e * fx.Int32(kBS_per_expert_dw) + np_list[mw] * fx.Int32(kBS_stride_n0_dw)
         ) * fx.Int32(4)
         base = rocdl.readfirstlane(T.i32, base)
         b_scale_s_base.append(base)
-        b_scale_s_base_hi.append(base + fx.Int32(16 * kBS_stride_k0_dw * 4))
 
     accm = [[None] * 4 for _ in range(kMChunks)]
     # B is triple-buffered. With only 2 buffers the load that refills b[slot_b]
@@ -325,7 +311,6 @@ def _gemm1_body(
     # spread evenly through the mfma stream.
     kBStages = 3
     b = [[[None, None] for _ in range(4)] for _ in range(kBStages)]
-    b_scale_v = [[None, None] for _ in range(kStages)]
 
     def issue_a_load_lds(slot, kt):
         for sub in range_constexpr(kSubBlocks):
@@ -512,20 +497,6 @@ def _gemm1_body(
             )
         )
 
-    def issue_b_scale_load(bs_slot, K_C):
-        v = ((lane_div_16 * fx.Int32(16)) + lane_mod_16) * fx.Int32(4)
-        K_C_HI = K_C // 16
-        imm = (K_C - K_C_HI * 16) * (kBS_stride_k0_dw * 4)
-        for mw in range_constexpr(2):
-            s_off = b_scale_s_base[mw] if K_C_HI == 0 else b_scale_s_base_hi[mw]
-            bs_slot[mw] = buffer_ops.buffer_load(
-                bscale_rsrc,
-                (v + fx.Int32(imm)) // fx.Int32(4),
-                vec_width=1,
-                dtype=T.i32,
-                soffset_bytes=s_off,
-            )
-
     # ---- wide (dwordx4) B-scale path -------------------------------------
     # gather: lane g reads the 16 contiguous bytes at unit_base + grp*1024 + g*16
     #   and writes them to LDS at wave_region + g*16. Because the gather is dense
@@ -663,7 +634,6 @@ def _gemm1_body(
         for _t in interleave[nth:]:
             _t()
 
-    _bsc_x4 = _BSC_X4
 
     # The A / A-scale ds_reads of one iteration, in the order their consumers
     # need them.
@@ -703,15 +673,12 @@ def _gemm1_body(
     for K_C in range_constexpr(kStages):
         issue_a_load_lds(K_C, K_C)
     rocdl.sched_barrier(0)
-    if const_expr(_bsc_x4):
-        # Group 0 first so it is the oldest VMEM in the prologue and the steady
-        # fence has certainly retired it before iteration 0 reads it.
-        issue_b_scale_gather(0)
+    # Group 0 first so it is the oldest VMEM in the prologue and the steady
+    # fence has certainly retired it before iteration 0 reads it.
+    issue_b_scale_gather(0)
     for K_C in range_constexpr(kStages):
         for j in range_constexpr(4):
             issue_b_load_j(b[K_C], K_C, j)
-        if const_expr(not _bsc_x4):
-            issue_b_scale_load(b_scale_v[K_C], K_C)
 
     # Iteration 0's A / A-scale fragments. Every later iteration gets these
     # from the previous one's weave, so the steady loop never has a ds_read
@@ -722,17 +689,13 @@ def _gemm1_body(
     gpu.barrier()
     asc_pipe[0] = issue_a_scale_ds_read(0)
     a_pipe[0] = issue_a_ds_read(0)
-    if const_expr(_bsc_x4):
-        bsc_pipe[0] = read_b_scale(0)
+    bsc_pipe[0] = read_b_scale(0)
 
     for OFFSET in range_constexpr(kUnroll): #  28 主循环.
         K_C = kStages + OFFSET # 2 + i
         read_slot = OFFSET % kAStages # 
         write_slot = K_C % kAStages
         slot_b = OFFSET % kBStages
-        # B-scale keeps its own 2-deep register buffer (independent of the B
-        # data buffers), so it is indexed with kStages, not kBStages.
-        slot_bsc = OFFSET % kStages
         # Tile K_C = OFFSET+kStages is the one being prefetched. With kBStages=3
         # its slot differs from the slot being read (OFFSET%3), so the refill has
         # no WAR against this iteration's mfma and can be issued anywhere.
@@ -753,14 +716,11 @@ def _gemm1_body(
         # barrier with no ds_read block in front of it.
         a_cur = a_pipe[0]
         asc_cur = asc_pipe[0]
-        if const_expr(_bsc_x4):
-            # Read out of LDS by the previous iteration's weave, like the A
-            # fragments -- so no ds_read sits between the barrier and the first
-            # mfma. Each wave owns its own region of s_bsc, so there is no
-            # cross-wave ordering to respect here.
-            bs_cur = bsc_pipe[0]
-        else:
-            bs_cur = b_scale_v[slot_bsc]
+        # Read out of LDS by the previous iteration's weave, like the A
+        # fragments -- so no ds_read sits between the barrier and the first
+        # mfma. Each wave owns its own region of s_bsc, so there is no
+        # cross-wave ordering to respect here.
+        bs_cur = bsc_pipe[0]
         a_nxt = [[None, None] for _ in range(kMChunks)]
         asc_nxt = [None] * kSubBlocks
         a_pipe[1], asc_pipe[1] = a_nxt, asc_nxt
@@ -794,41 +754,36 @@ def _gemm1_body(
                 issue_a_ds_read_one, a_nxt,
                 ((0, 0), (nxt_slot, 0, 0)), ((0, 1), (nxt_slot, 0, 1)),
             )
-            + (_store_thunks(read_b_scale, bsc_pipe, (1, (OFFSET + 1,)))
-               if _bsc_x4 else [])
+            + _store_thunks(read_b_scale, bsc_pipe, (1, (OFFSET + 1,)))
             + _thunks(issue_b_load_one,
                       *[(b[write_b], K_C, j, h)
                         for h in range(2) for j in range(4)])
         )
-        if const_expr(_bsc_x4):
-            # One gather covers _BSC_TILES tiles, so it only runs on the first
-            # iteration of a group -- which gives the next group a full group of
-            # VMEM to land behind. Issuing it on the LAST iteration would leave
-            # one iteration of lead and the fence would retire nothing (nan).
-            # It goes after the B loads so it does not move the last albd, which
-            # is what sets the fence; being the newest op in flight costs it
-            # nothing, since nobody reads it for another four iterations.
-            _grp = OFFSET // _BSC_TILES + 1
-            if const_expr(OFFSET % _BSC_TILES == 0
-                          and _grp * _BSC_TILES < K_TILES_TOTAL):
-                il = il + _thunks(issue_b_scale_gather, (_grp,))
+        # One gather covers _BSC_TILES tiles, so it only runs on the first
+        # iteration of a group -- which gives the next group a full group of
+        # VMEM to land behind. Issuing it on the LAST iteration would leave one
+        # iteration of lead and the fence would retire nothing (nan). It goes
+        # after the B loads so it does not move the last albd, which is what
+        # sets the fence; being the newest op in flight costs it nothing, since
+        # nobody reads it for another four iterations.
+        _grp = OFFSET // _BSC_TILES + 1
+        if const_expr(OFFSET % _BSC_TILES == 0
+                      and _grp * _BSC_TILES < K_TILES_TOTAL):
+            il = il + _thunks(issue_b_scale_gather, (_grp,))
         mfma_iouter(
             b[slot_b], a_cur, asc_cur, bs_cur, (OFFSET == 0),
             il, _IOUT_STRIDE,
         )
-        if const_expr(not _bsc_x4):
-            issue_b_scale_load(b_scale_v[slot_bsc], K_C)
         # what this iteration prefetched becomes the next one's operands
         a_pipe[0], asc_pipe[0] = a_pipe[1], asc_pipe[1]
-        if const_expr(_bsc_x4):
-            _rotate_pipe(bsc_pipe)
+        bsc_pipe[0] = bsc_pipe[1]
 
     for S in range_constexpr(kStages):
         kt = K_TILES_TOTAL - kStages + S
         gpu.barrier()
         asc_cur = issue_a_scale_ds_read(kt)
         a_cur = issue_a_ds_read(kt % kAStages)
-        bs_t = read_b_scale(kt) if const_expr(_bsc_x4) else b_scale_v[kt % kStages]
+        bs_t = read_b_scale(kt)
         for J in range_constexpr(4):
             mfma_cluster(b[kt % kBStages], a_cur, asc_cur, bs_t, J, init=False)
 
@@ -948,7 +903,7 @@ def _bm_constants(BM, BN, KH_TILE, K_TILES_TOTAL):
     s_asc_bytes = kSubBlocks * K_TILES_TOTAL * 256
     lds_acc_bytes = lds_acc_bytes_for(BM, BN)
     lds_bytes = max(
-        s_aq_bytes + s_asc_bytes + (_BSC_LDS_BYTES if _BSC_X4 else 0), lds_acc_bytes
+        s_aq_bytes + s_asc_bytes + _BSC_LDS_BYTES, lds_acc_bytes
     )
     return kAStages, kSubBlocks, kMChunks, lds_bytes
 
