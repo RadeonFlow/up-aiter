@@ -65,6 +65,9 @@ _BSC_SLOT_BYTES = 4 * _BSC_WAVE_BYTES  # 4 waves = 8 KB
 _BSC_LDS_BYTES = _BSC_SLOTS * _BSC_SLOT_BYTES  # 16 KB
 
 
+_ALATE = __import__("os").environ.get("G1_ALATE", "0") == "1"
+
+
 def _lds_scopes(n_a_slots):
     """One #llvm.alias_scope per disjoint LDS region, in a shared domain.
 
@@ -650,7 +653,9 @@ def _gemm1_body(
     # its use, so they get a full iteration of slack. The albd sit at the FRONT
     # of the 12, so their slack is only what follows them. Same counter, two
     # different distances. See resource_inspect/gemm1_fence_explained.txt.
-    _IOUT_POST_ALBD = 2 * 4  # the 8 B loads that follow the last albd
+    # VMEM ops after the last albd. _ALATE puts a whole extra iteration
+    # (12 ops) between an albd and the fence that has to cover it.
+    _IOUT_POST_ALBD = 2 * 4 + (12 if _ALATE else 0)
 
     # ---- prologue ---------------------------------------------------------
     # A-scale for the whole K range is resident in LDS, so it loads once.
@@ -662,8 +667,8 @@ def _gemm1_body(
     # be the same vmcnt(8) as every other iteration. Interleaving would leave
     # only 5 VMEM behind the last albd and force a tighter first fence.
     # sched_barrier stops the compiler from mixing the two groups back up.
-    for K_C in range_constexpr(kStages):
-        issue_a_load_lds(K_C, K_C)
+    for K_C in range_constexpr(kStages + (1 if _ALATE else 0)):
+        issue_a_load_lds(K_C % kAStages, K_C)
     rocdl.sched_barrier(0)
     # Group 0 first so it is the oldest VMEM in the prologue and the steady
     # fence has certainly retired it before iteration 0 reads it.
@@ -686,7 +691,12 @@ def _gemm1_body(
     for OFFSET in range_constexpr(kUnroll): #  28 主循环.
         K_C = kStages + OFFSET # 2 + i
         read_slot = OFFSET % kAStages # 
-        write_slot = K_C % kAStages
+        # _ALATE: refill the slot this iteration's mfma are done with. Their
+        # fragments were ds_read into registers last iteration, and the barrier
+        # at the top guarantees all 4 waves finished those reads, so slot
+        # OFFSET%3 is dead LDS. Its next reader is iteration OFFSET+2, two
+        # iterations out instead of one, which is what lets the fence relax.
+        write_slot = OFFSET % kAStages if _ALATE else K_C % kAStages
         slot_b = OFFSET % kBStages
         # Tile K_C = OFFSET+kStages is the one being prefetched. With kBStages=3
         # its slot differs from the slot being read (OFFSET%3), so the refill has
@@ -720,6 +730,13 @@ def _gemm1_body(
         # Clamp: the last iteration would prefetch tile K_TILES_TOTAL. The
         # drain re-reads what it needs, so the extra read is idempotent.
         nxt_kt = min(K_C - kStages + 1, K_TILES_TOTAL - 1)
+        # Tile the albd fetches. Under _ALATE the slot being written is next
+        # ds_read at OFFSET+2, feeding OFFSET+3's mfma, so it must hold tile
+        # OFFSET+3 == K_C+1. -1 means past the end and the load is skipped;
+        # clamping instead would put a live tile in the wrong slot.
+        _ALBD_KT = (
+            (K_C + 1 if K_C + 1 < K_TILES_TOTAL else -1) if _ALATE else K_C
+        )
 
         # The schedule for this iteration's 64 mfma, in issue order. One
         # thunk goes out every _IOUT_STRIDE mfma.
@@ -737,8 +754,9 @@ def _gemm1_body(
         il = (
             _a_read_thunks(_A_READ_ORDER, a_nxt, asc_nxt, nxt_slot, nxt_kt,
                            issue_a_ds_read_one, issue_a_scale_ds_read_one)
-            + _thunks(issue_a_load_lds_one,
-                      *[(write_slot, K_C, s) for s in range(kSubBlocks)])
+            + (_thunks(issue_a_load_lds_one,
+                       *[(write_slot, _ALBD_KT, s) for s in range(kSubBlocks)])
+               if _ALBD_KT >= 0 else [])
             + _store_thunks(
                 issue_a_scale_ds_read_one, asc_nxt, (0, (nxt_kt, 0)),
             )
