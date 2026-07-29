@@ -65,8 +65,11 @@ _BSC_SLOT_BYTES = 4 * _BSC_WAVE_BYTES  # 4 waves = 8 KB
 _BSC_LDS_BYTES = _BSC_SLOTS * _BSC_SLOT_BYTES  # 16 KB
 
 
-def _a_slot_scopes(n):
-    """One #llvm.alias_scope per A LDS slot, all in a shared domain.
+def _lds_scopes(n_a_slots):
+    """One #llvm.alias_scope per disjoint LDS region, in a shared domain.
+
+    Regions: one per A slot (n_a_slots of them), then the A-scale area and the
+    B-scale gather area, which are separate allocations entirely.
 
     si-insert-waitcnts asks, for every LDS access, whether it may alias any
     outstanding LDS DMA (SIInsertWaitcnts.cpp:2542). With alias info it checks
@@ -79,17 +82,19 @@ def _a_slot_scopes(n):
     """
     from flydsl._mlir import ir
 
-    dom = '#llvm.alias_scope_domain<id = "gemm1.A", description = "A LDS slots">'
+    dom = '#llvm.alias_scope_domain<id = "gemm1.lds", description = "gemm1 LDS">'
+    names = [f"A.{i}" for i in range(n_a_slots)] + ["Asc", "Bsc"]
     return [
-        ir.Attribute.parse(f'#llvm.alias_scope<id = "gemm1.A.{i}", domain = {dom}>')
-        for i in range(n)
+        ir.Attribute.parse(f'#llvm.alias_scope<id = "gemm1.{n}", domain = {dom}>')
+        for n in names
     ]
 
 
 def _tag_alias(op, scopes, slot):
-    """Mark `op` as touching only `slot`, and no other A slot."""
+    """Mark `op` as touching only LDS region `slot`, and no other."""
     from flydsl._mlir import ir
 
+    op = getattr(op, "owner", op)
     others = [sc for i, sc in enumerate(scopes) if i != slot]
     op.attributes["alias_scopes"] = ir.ArrayAttr.get([scopes[slot]])
     op.attributes["noalias_scopes"] = ir.ArrayAttr.get(others)
@@ -297,7 +302,9 @@ def _gemm1_body(
     )
     lds_acc = SmemPtr(lds_base, lds_off, T.f32, shape=(BM * BN,)) # 128 * 256 * 4 = 128KB 所以这里是随便共用的.
 
-    _A_SCOPES = _a_slot_scopes(kAStages)
+    _LDS_SCOPES = _lds_scopes(kAStages)
+    _SC_ASC = kAStages       # index of the A-scale region's scope
+    _SC_BSC = kAStages + 1   # index of the B-scale region's scope
 
     cached_actual_row = []
     for sub in range_constexpr(kSubBlocks): # 4
@@ -362,7 +369,7 @@ def _gemm1_body(
             fx.Int32(0),
             fx.Int32(0),
         )
-        _tag_alias(_dma.owner if hasattr(_dma, "owner") else _dma, _A_SCOPES, slot)
+        _tag_alias(_dma, _LDS_SCOPES, slot)
 
     def issue_a_load_lds(slot, kt):
         """All kSubBlocks steps of one tile, for the prologue."""
@@ -377,7 +384,7 @@ def _gemm1_body(
         lds_row = lane_mod_16 + fx.Int32(i * 16)
         off = fx.Int32(slot * (BM * KH_TILE)) + lds_row * fx.Int32(KH_TILE) + lds_col
         val = llvm.load(T.vec(4, T.i32), _gep3(base_ptr, off))
-        _tag_alias(val.owner, _A_SCOPES, slot)
+        _tag_alias(val.owner, _LDS_SCOPES, slot)
         return val
 
     def issue_a_scale_ds_read_one(kt, sub):
@@ -389,7 +396,9 @@ def _gemm1_body(
             + lane_div_16 * fx.Int32(16)
             + lane_mod_16
         )
-        return llvm.load(T.i32, _gep3(base_ptr, lds_dw * fx.Int32(4)))
+        val = llvm.load(T.i32, _gep3(base_ptr, lds_dw * fx.Int32(4)))
+        _tag_alias(val.owner, _LDS_SCOPES, _SC_ASC)
+        return val
 
     def issue_a_ds_read(slot):
         """All A fragments of one slot, for the prologue and the drain."""
@@ -411,7 +420,7 @@ def _gemm1_body(
                 T.i32, (chunk_base + fx.Int32(sub)) * fx.Int32(kAS_per_chunk_dw * 4)
             )
             lds_sub = fx.Int32(sub * kAS_per_chunk_dw * 4)
-            rocdl.raw_ptr_buffer_load_lds(
+            _d = rocdl.raw_ptr_buffer_load_lds(
                 ascale_rsrc,
                 _lds_ptr3(asc_base, lds_sub + wave * fx.Int32(1024)),
                 fx.Int32(16),
@@ -420,10 +429,11 @@ def _gemm1_body(
                 fx.Int32(0),
                 fx.Int32(0),
             )
+            _tag_alias(_d, _LDS_SCOPES, _SC_ASC)
             for d in range_constexpr(3):
                 byte_off = 4096 + d * 1024
                 s_off = rocdl.readfirstlane(T.i32, s_chunk + fx.Int32(byte_off))
-                rocdl.raw_ptr_buffer_load_lds(
+                _d = rocdl.raw_ptr_buffer_load_lds(
                     ascale_rsrc,
                     _lds_ptr3(
                         asc_base, lds_sub + fx.Int32(byte_off) + wave * fx.Int32(256)
@@ -434,19 +444,11 @@ def _gemm1_body(
                     fx.Int32(0),
                     fx.Int32(0),
                 )
+                _tag_alias(_d, _LDS_SCOPES, _SC_ASC)
 
     def issue_a_scale_ds_read(kt):
-        base_ptr = _lds_base_ptr3(s_asc.get())
-        out = []
-        for sub in range_constexpr(kSubBlocks):
-            lds_dw = (
-                fx.Int32(sub * kAS_per_chunk_dw)
-                + fx.Int32(kt * 64)
-                + lane_div_16 * fx.Int32(16)
-                + lane_mod_16
-            )
-            out.append(llvm.load(T.i32, _gep3(base_ptr, lds_dw * fx.Int32(4))))
-        return out
+        """All kSubBlocks A-scale reads of tile kt."""
+        return [issue_a_scale_ds_read_one(kt, sub) for sub in range(kSubBlocks)]
 
     def issue_b_load_j(b_slot, K_C, j):
         v = (
@@ -506,7 +508,7 @@ def _gemm1_body(
             s_off = rocdl.readfirstlane(
                 T.i32, _raw(b_scale_s_base[mw] + fx.Int32(grp * _BSC_TILES * 256))
             )
-            rocdl.raw_ptr_buffer_load_lds(
+            _d = rocdl.raw_ptr_buffer_load_lds(
                 bscale_rsrc,
                 _lds_ptr3(bsc_lds_base, lds_off_b),
                 fx.Int32(16),
@@ -515,6 +517,7 @@ def _gemm1_body(
                 fx.Int32(0),
                 fx.Int32(0),
             )
+            _tag_alias(_d, _LDS_SCOPES, _SC_BSC)
 
     def read_b_scale(K_C):
         grp = K_C // _BSC_TILES
@@ -528,7 +531,9 @@ def _gemm1_body(
                 + bsc_wave_off
                 + bsc_read_v
             )
-            out[mw] = fx.Int32(llvm.load(T.i32, _gep3(base_ptr, off)))
+            _bv = llvm.load(T.i32, _gep3(base_ptr, off))
+            _tag_alias(_bv.owner, _LDS_SCOPES, _SC_BSC)
+            out[mw] = fx.Int32(_bv)
         return out
 
     mfma_ty = T.f32x4
