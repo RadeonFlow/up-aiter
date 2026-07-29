@@ -65,9 +65,6 @@ _BSC_SLOT_BYTES = 4 * _BSC_WAVE_BYTES  # 4 waves = 8 KB
 _BSC_LDS_BYTES = _BSC_SLOTS * _BSC_SLOT_BYTES  # 16 KB
 
 
-_ALATE = __import__("os").environ.get("G1_ALATE", "0") == "1"
-
-
 def _lds_scopes(n_a_slots):
     """One #llvm.alias_scope per disjoint LDS region, in a shared domain.
 
@@ -640,22 +637,26 @@ def _gemm1_body(
     # queue on L1 and their issue latency blows up.
     _IOUT_STRIDE = 2
 
-    # Steady fence. An iteration issues 4 albd then 8 B loads, and vmcnt(N)
-    # retires oldest-first, so waiting for <= 8 in flight retires exactly the
-    # 4 albd. That is what the barrier needs, because right after it the other
-    # 3 waves start ds_read-ing that A tile. It is also the loosest legal
-    # value: only 12 VMEM are ever in flight, so vmcnt(9) or looser leaves an
-    # albd unlanded -- swept, and cosine degrades monotonically from vmcnt(9)
-    # on (0.0133, 0.0239, 0.0561, 0.1043 for 9..12).
+    # Steady fence: VMEM ops issued after the last albd this fence covers.
+    # vmcnt(N) retires oldest-first, and an iteration issues 4 albd then 8 B
+    # loads, so N is a count of ops-since, i.e. a distance in the issue stream.
     #
-    # Note this is NOT the same budget as the compiler's own vmcnt(12)/(11)/(10)
-    # guarding the B operands. Those cover a bld issued two iterations before
-    # its use, so they get a full iteration of slack. The albd sit at the FRONT
-    # of the 12, so their slack is only what follows them. Same counter, two
-    # different distances. See resource_inspect/gemm1_fence_explained.txt.
-    # VMEM ops after the last albd. _ALATE puts a whole extra iteration
-    # (12 ops) between an albd and the fence that has to cover it.
-    _IOUT_POST_ALBD = 2 * 4 + (12 if _ALATE else 0)
+    # An albd writes the slot whose reader is two iterations out, so the fence
+    # that has to cover it is not this iteration's but the next one's: a whole
+    # extra iteration of 12 VMEM sits in between. 8 + 12 = 20.
+    #
+    # If the albd instead refilled the slot read one iteration out, the fence
+    # would be the same iteration's and the budget only 8 -- the albd sit at
+    # the FRONT of the 12 in flight, so their slack is just what follows them.
+    # That was the earlier schedule; swept, cosine degraded monotonically from
+    # vmcnt(9) on (0.0133, 0.0239, 0.0561, 0.1043 for 9..12), confirming 8 was
+    # hard against the wall. Pushing the refill one slot later buys the 12.
+    #
+    # Note this is a different budget from the compiler's own vmcnt guarding
+    # the B operands, even though it is the same counter -- those cover a bld
+    # issued two iterations before its use. Two distances, one counter.
+    # See resource_inspect/gemm1_fence_explained.txt.
+    _IOUT_POST_ALBD = 2 * 4 + 12
 
     # B data loads issued after everything the first ds_reads need.
     # The prologue issues, in order: 16 A-scale DMAs, 8 albd, 2 B-scale
@@ -678,7 +679,9 @@ def _gemm1_body(
     # be the same vmcnt(8) as every other iteration. Interleaving would leave
     # only 5 VMEM behind the last albd and force a tighter first fence.
     # sched_barrier stops the compiler from mixing the two groups back up.
-    for K_C in range_constexpr(kStages + (1 if _ALATE else 0)):
+    # kStages + 1: the steady loop's albd runs one tile ahead of the slot it
+    # would naively refill, so the prologue has to prime all three A slots.
+    for K_C in range_constexpr(kStages + 1):
         issue_a_load_lds(K_C % kAStages, K_C)
     rocdl.sched_barrier(0)
     # Group 0 first so it is the oldest VMEM in the prologue and the steady
@@ -713,12 +716,12 @@ def _gemm1_body(
     for OFFSET in range_constexpr(kUnroll): #  28 主循环.
         K_C = kStages + OFFSET # 2 + i
         read_slot = OFFSET % kAStages # 
-        # _ALATE: refill the slot this iteration's mfma are done with. Their
-        # fragments were ds_read into registers last iteration, and the barrier
-        # at the top guarantees all 4 waves finished those reads, so slot
-        # OFFSET%3 is dead LDS. Its next reader is iteration OFFSET+2, two
-        # iterations out instead of one, which is what lets the fence relax.
-        write_slot = OFFSET % kAStages if _ALATE else K_C % kAStages
+        # Refill the slot this iteration's mfma are done with. Their fragments
+        # were ds_read into registers last iteration, and the barrier at the
+        # top guarantees all 4 waves finished those reads, so slot OFFSET%3 is
+        # dead LDS. Its next reader is iteration OFFSET+2, two iterations out
+        # instead of one, which is what lets _IOUT_POST_ALBD relax to 20.
+        write_slot = OFFSET % kAStages
         slot_b = OFFSET % kBStages
         # Tile K_C = OFFSET+kStages is the one being prefetched. With kBStages=3
         # its slot differs from the slot being read (OFFSET%3), so the refill has
@@ -752,13 +755,11 @@ def _gemm1_body(
         # Clamp: the last iteration would prefetch tile K_TILES_TOTAL. The
         # drain re-reads what it needs, so the extra read is idempotent.
         nxt_kt = min(K_C - kStages + 1, K_TILES_TOTAL - 1)
-        # Tile the albd fetches. Under _ALATE the slot being written is next
-        # ds_read at OFFSET+2, feeding OFFSET+3's mfma, so it must hold tile
-        # OFFSET+3 == K_C+1. -1 means past the end and the load is skipped;
-        # clamping instead would put a live tile in the wrong slot.
-        _ALBD_KT = (
-            (K_C + 1 if K_C + 1 < K_TILES_TOTAL else -1) if _ALATE else K_C
-        )
+        # Tile the albd fetches. write_slot is next ds_read at OFFSET+2,
+        # feeding OFFSET+3's mfma, so it must hold tile OFFSET+3 == K_C+1.
+        # -1 means past the end and the load is skipped; clamping instead
+        # would put a live tile in the wrong slot.
+        _ALBD_KT = K_C + 1 if K_C + 1 < K_TILES_TOTAL else -1
 
         # The schedule for this iteration's 64 mfma, in issue order. One
         # thunk goes out every _IOUT_STRIDE mfma.
