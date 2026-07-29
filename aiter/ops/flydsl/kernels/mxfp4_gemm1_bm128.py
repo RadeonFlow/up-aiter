@@ -43,12 +43,6 @@ from .mxfp4_gemm_common import (
 )
 
 
-# Issue the A global->LDS DMA as inline asm instead of letting the compiler
-# emit it. That hides the LDS write from alias analysis, which otherwise adds a
-# redundant s_waitcnt before the following ds_reads. Correct but perf-neutral
-# as measured, so off.
-_ASM_ALBD = True
-
 # B-scale wide load. The preshuffled B-scale for one n0 unit (32 N rows) is
 # contiguous along K -- K-tile t sits at byte t*256 within the unit -- so one
 # `buffer_load_dwordx4 ... lds` (64 lanes x 16 B = 1024 B) fetches FOUR K-tiles
@@ -312,54 +306,13 @@ def _gemm1_body(
     kBStages = 3
     b = [[[None, None] for _ in range(4)] for _ in range(kBStages)]
 
-    def issue_a_load_lds(slot, kt):
-        for sub in range_constexpr(kSubBlocks):
-            lds_row = wave * fx.Int32(BM // 4) + fx.Int32(sub * 8)
-            mask = _lds_swizzle_mask(lds_row + lane_div_8)
-            voffset = ((lane_mod_8 * fx.Int32(16)) ^ mask) + cached_actual_row[
-                sub
-            ] * fx.Int32(K_HALF)
-            base_i32 = fx.Int32(
-                memref_dialect.extract_aligned_pointer_as_index(s_aq.get())
-            )
-            off = fx.Int32(slot * (BM * KH_TILE)) + lds_row * fx.Int32(KH_TILE)
-            if const_expr(_ASM_ALBD):
-                # INLINE-ASM g2s (fp4_gemm_4wave idiom): LLVM sees no LDS write
-                # here, so its alias analysis stops inserting the extra
-                # `s_waitcnt vmcnt(10)` before the following ds_reads. The A slot
-                # read this iteration was filled kAStages iters ago and is already
-                # covered by our explicit vmcnt fence.
-                m0 = rocdl.readfirstlane(T.i32, _raw(base_i32 + off))
-                llvm.inline_asm(
-                    None,
-                    [
-                        _raw(m0),
-                        _raw(voffset),
-                        _raw(aq_rsrc),
-                        _raw(fx.Int32(kt * KH_TILE)),
-                    ],
-                    "s_mov_b32 m0, $0\nbuffer_load_dwordx4 $1, $2, $3 offen lds",
-                    "s,v,s,s",
-                    has_side_effects=True,
-                )
-            else:
-                rocdl.raw_ptr_buffer_load_lds(
-                    aq_rsrc,
-                    _lds_ptr3(base_i32, off),
-                    fx.Int32(16),
-                    voffset,
-                    fx.Int32(kt * KH_TILE),
-                    fx.Int32(0),
-                    fx.Int32(0),
-                )
-
     def issue_a_load_lds_one(slot, kt, sub):
-        """One albd step, for weaving into the mfma stream.
+        """One A global->LDS DMA step: 32 M rows of tile `kt` into `slot`.
 
         Reads the row out of cached_actual_row, loaded once before the loop.
-        Re-issuing the `arg_mind` load here instead makes the m0 readfirstlane
-        depend on it, and the compiler then emits `s_waitcnt vmcnt(0)` before
-        every albd -- 105 of them, serializing the whole pipeline.
+        Re-issuing the `arg_mind` load here instead makes the address depend on
+        it, and the compiler then emits `s_waitcnt vmcnt(0)` before every one
+        of these -- 105 of them, serializing the whole pipeline.
         """
         lds_row = wave * fx.Int32(BM // 4) + fx.Int32(sub * 8)
         mask = _lds_swizzle_mask(lds_row + lane_div_8)
@@ -368,14 +321,20 @@ def _gemm1_body(
         ) * fx.Int32(K_HALF)
         base_i32 = fx.Int32(memref_dialect.extract_aligned_pointer_as_index(s_aq.get()))
         off = fx.Int32(slot * (BM * KH_TILE)) + lds_row * fx.Int32(KH_TILE)
-        m0 = rocdl.readfirstlane(T.i32, _raw(base_i32 + off))
-        llvm.inline_asm(
-            None,
-            [_raw(m0), _raw(voffset), _raw(aq_rsrc), _raw(fx.Int32(kt * KH_TILE))],
-            "s_mov_b32 m0, $0\nbuffer_load_dwordx4 $1, $2, $3 offen lds",
-            "s,v,s,s",
-            has_side_effects=True,
+        rocdl.raw_ptr_buffer_load_lds(
+            aq_rsrc,
+            _lds_ptr3(base_i32, off),
+            fx.Int32(16),
+            voffset,
+            fx.Int32(kt * KH_TILE),
+            fx.Int32(0),
+            fx.Int32(0),
         )
+
+    def issue_a_load_lds(slot, kt):
+        """All kSubBlocks steps of one tile, for the prologue."""
+        for sub in range_constexpr(kSubBlocks):
+            issue_a_load_lds_one(slot, kt, sub)
 
     def issue_a_ds_read_one(slot, i, k):
         """One A fragment ds_read (M-block i, k-half k) -> i32x4."""
@@ -516,17 +475,18 @@ def _gemm1_body(
                 + bsc_wave_off
                 + fx.Int32(mw * _BSC_TILES * 256)
             )
-            m0 = rocdl.readfirstlane(T.i32, _raw(bsc_lds_base + lds_off_b))
             # byte offset of this group inside the n0 unit = grp*_BSC_TILES*256
             s_off = rocdl.readfirstlane(
                 T.i32, _raw(b_scale_s_base[mw] + fx.Int32(grp * _BSC_TILES * 256))
             )
-            llvm.inline_asm(
-                None,
-                [_raw(m0), _raw(bsc_v), _raw(bscale_rsrc), _raw(s_off)],
-                "s_mov_b32 m0, $0\nbuffer_load_dwordx4 $1, $2, $3 offen lds",
-                "s,v,s,s",
-                has_side_effects=True,
+            rocdl.raw_ptr_buffer_load_lds(
+                bscale_rsrc,
+                _lds_ptr3(bsc_lds_base, lds_off_b),
+                fx.Int32(16),
+                bsc_v,
+                s_off,
+                fx.Int32(0),
+                fx.Int32(0),
             )
 
     def read_b_scale(K_C):
